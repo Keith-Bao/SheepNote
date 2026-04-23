@@ -854,7 +854,17 @@ class StickyNote:
                             pass
 
     def _refresh(self, focus_new=False):
-        self._flush_entries()           # 先保存所有正在编辑的内容
+        # 保存新任务输入框里尚未提交的文字（用户未按 Enter）
+        pending_new = ""
+        if self._new_entry:
+            try:
+                val = self._new_entry.get()
+                if val and val != "添加新任务…":
+                    pending_new = val
+            except tk.TclError:
+                pass
+
+        self._flush_entries()           # 已有任务的实时内容兜底同步
         for w in self.sf.winfo_children():
             w.destroy()
         self._new_entry = self._new_cb = None
@@ -862,6 +872,13 @@ class StickyNote:
             self._make_row(i, task)
         if not self._locked:
             self._new_entry = self._make_new_row()
+            # 恢复待定文字，让用户继续输入
+            if pending_new and self._new_entry:
+                self._new_entry.delete(0, tk.END)
+                self._new_entry.insert(0, pending_new)
+                self._new_entry.config(fg=FG_TASK)
+                if self._new_cb:
+                    self._new_cb.config(fg="#AAAAAA")
         if focus_new and self._new_entry:
             self.win.after(30, self._new_entry.focus_set)
 
@@ -902,6 +919,7 @@ class StickyNote:
             ent.pack(side=tk.LEFT, fill=tk.X, expand=True)
             ent.bind("<FocusOut>", lambda e, i=idx: self._save_text(i, e.widget))
             ent.bind("<Return>",   lambda e: self._focus_new())
+            ent.bind("<KeyRelease>", lambda e, i=idx: self._live_save(i, e.widget))
             ent.bind("<Enter>", hl_on); ent.bind("<Leave>", hl_off)
 
         if interactive:
@@ -955,6 +973,17 @@ class StickyNote:
         if not text or text == "添加新任务…": return
         self.tasks.append({"text": text, "done": False})
         self.app.save(); self._refresh(focus_new=True)
+
+    def _live_save(self, idx: int, ent: tk.Entry):
+        """每次按键实时写入 self.tasks（不触发删除/保存文件，仅同步内存）。"""
+        if idx >= len(self.tasks):
+            return
+        try:
+            text = ent.get().strip()
+        except tk.TclError:
+            return
+        if text:
+            self.tasks[idx]["text"] = text
 
     def _save_text(self, idx: int, ent: tk.Entry):
         if idx >= len(self.tasks): return
