@@ -971,6 +971,11 @@ class StickyNote:
     def _add(self, ent: tk.Entry):
         text = ent.get().strip()
         if not text or text == "添加新任务…": return
+        # 立刻清空输入框，防止 _refresh() 的 pending_new 把已提交的文字还原回去
+        try:
+            ent.delete(0, tk.END)
+        except tk.TclError:
+            pass
         self.tasks.append({"text": text, "done": False})
         self.app.save(); self._refresh(focus_new=True)
 
