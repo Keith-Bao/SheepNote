@@ -835,7 +835,26 @@ class StickyNote:
     def _f(self)      -> tuple: return ("Microsoft YaHei", self._fs)
     def _f_done(self) -> tuple: return ("Microsoft YaHei", self._fs, "overstrike")
 
+    def _flush_entries(self):
+        """重绘前把正在编辑的 Entry 文本同步到 self.tasks，防止内容丢失。"""
+        rows = [w for w in self.sf.winfo_children() if isinstance(w, tk.Frame)]
+        for i, outer in enumerate(rows):
+            if i >= len(self.tasks):
+                break  # 最后一行是"添加新任务"占位行，跳过
+            for inner in outer.winfo_children():
+                if not isinstance(inner, tk.Frame):
+                    continue
+                for w in inner.winfo_children():
+                    if isinstance(w, tk.Entry):
+                        try:
+                            text = w.get().strip()
+                            if text and text != "添加新任务…":
+                                self.tasks[i]["text"] = text
+                        except tk.TclError:
+                            pass
+
     def _refresh(self, focus_new=False):
+        self._flush_entries()           # 先保存所有正在编辑的内容
         for w in self.sf.winfo_children():
             w.destroy()
         self._new_entry = self._new_cb = None
