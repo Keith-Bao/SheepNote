@@ -1,0 +1,9 @@
+# 用户数据（不入库）
+notes_data.json
+
+# PyInstaller 构建产物
+build/
+dist/
+*.spec
+__pycache__/
+*.pyc
