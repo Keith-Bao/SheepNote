@@ -219,17 +219,11 @@ class StickyNote:
 
     def _apply_tb_color(self):
         """把当前工具栏色刷新到所有工具栏 widget 上。"""
-        self.tb.config(bg=self._tbg)
-        self.rbar.config(bg=self._tbg)
-        for w in self._tb_widgets:
-            try:
-                txt = w.cget("text")
-                if txt == "│":
-                    w.config(bg=self._tbg, fg=self._tbsep)
-                else:
-                    w.config(bg=self._tbg, fg=self._tbfg)
-            except Exception:
-                pass
+        # 折叠时保持隐藏，展开状态才刷颜色
+        if self._tb_h > 0:
+            self._set_tb_content_visible(True)
+        # 缩放三角单独更新（Canvas polygon 不走上面的循环）
+        self._rsz_canvas.itemconfig(self._rsz_tri, fill=self._tbg)
 
     def _set_color(self, color: str):
         self._bg = color
@@ -239,6 +233,8 @@ class StickyNote:
         self._list_outer.configure(bg=color)
         self.canvas.configure(bg=color)
         self.sf.configure(bg=color)
+        self._rsz_canvas.configure(bg=color)   # 三角背景跟随便签色（视觉透明）
+        self._sb_canvas.configure(bg=color)    # 滚动条背景透明
         self._refresh()
         self.app.save()
 
@@ -246,10 +242,13 @@ class StickyNote:
     # UI 构建
     # ════════════════════════════════════════════════════════════════
     def _build(self):
-        # ── 工具栏 ─────────────────────────────────────────────────
-        self.tb = tk.Frame(self.win, bg=self._tbg, height=34)
+        # ── 工具栏（初始隐藏，hover 时滑出）───────────────────────────
+        self.tb = tk.Frame(self.win, bg=self._tbg, height=0)
         self.tb.pack(fill=tk.X)
         self.tb.pack_propagate(False)
+        self._tb_h        = 0     # 当前动画高度
+        self._tb_anim_id  = None  # after id: 动画帧
+        self._tb_hide_id  = None  # after id: 延迟隐藏
 
         self.title_lbl = tk.Label(
             self.tb, text="⠿  SheepNote",
@@ -308,8 +307,6 @@ class StickyNote:
 
         self.canvas = tk.Canvas(self._list_outer, bg=self._bg,
                                 highlightthickness=0)
-        self._sb = ttk.Scrollbar(self._list_outer, orient="vertical",
-                                 command=self.canvas.yview)
         self.sf = tk.Frame(self.canvas, bg=self._bg)
 
         self.sf.bind("<Configure>",
@@ -317,7 +314,7 @@ class StickyNote:
                          scrollregion=self.canvas.bbox("all")))
         self._cwin = self.canvas.create_window((0, 0), window=self.sf,
                                                anchor="nw")
-        self.canvas.configure(yscrollcommand=self._sb.set)
+        self.canvas.configure(yscrollcommand=self._on_yscroll)
         self.canvas.bind("<Configure>",
                          lambda e: self.canvas.itemconfig(
                              self._cwin, width=e.width))
@@ -335,15 +332,30 @@ class StickyNote:
         self.sf.bind("<Button-3>",
                      lambda e: self._ctx.tk_popup(e.x_root, e.y_root))
 
-        self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        self._sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.canvas.pack(fill=tk.BOTH, expand=True)
 
-        # ── 底部缩放条（颜色同工具栏）─────────────────────────────
-        self._bot = tk.Frame(self.win, bg=self._tbg, height=6, cursor="sizing")
-        self._bot.pack(fill=tk.X)
-        self._bot.bind("<ButtonPress-1>", self._resize_start)
-        self._bot.bind("<B1-Motion>",     self._resize_move)
-        self._tb_widgets.append(self._bot)   # 随工具栏一起换色
+        # Apple 风格悬浮滚动条（覆盖在右侧，滚动时显示）
+        self._sb_canvas = tk.Canvas(
+            self._list_outer, width=10, bg=self._bg,
+            highlightthickness=0, bd=0
+        )
+        self._sb_hide_id: str | None = None
+
+        # ── 右下角常驻缩放三角（无背景 + 半透明，浮层始终可见）──
+        self._rsz_canvas = tk.Canvas(
+            self.win, width=18, height=18,
+            bg=self._bg, highlightthickness=0, bd=0, cursor="sizing"
+        )
+        self._rsz_canvas.place(relx=1.0, rely=1.0, anchor="se")
+        self._rsz_tri = self._rsz_canvas.create_polygon(
+            0, 18, 18, 18, 18, 0,
+            fill=self._tbg, outline="", stipple="gray50"
+        )
+        self._rsz_canvas.bind("<ButtonPress-1>", self._resize_start)
+        self._rsz_canvas.bind("<B1-Motion>",     self._resize_move)
+
+        # 绑定 hover 显示/隐藏工具栏
+        self._bind_hover()
 
     # ── 工具栏按钮工厂（toolbar 专用）────────────────────────────
     def _tbtn(self, text, cmd, hover=None, parent=None) -> tk.Label:
@@ -363,9 +375,160 @@ class StickyNote:
         lbl.pack(side=tk.RIGHT, padx=2)
         self._tb_widgets.append(lbl)
 
+    # ── Apple 风格滚动条 ──────────────────────────────────────────
+    def _on_yscroll(self, first: str, last: str):
+        first, last = float(first), float(last)
+        if first <= 0.0 and last >= 1.0:
+            self._hide_scrollbar()
+            return
+        self._draw_scrollbar(first, last)
+
+    def _draw_scrollbar(self, first: float, last: float):
+        sc = self._sb_canvas
+        sc.delete("all")
+        h = sc.winfo_height()
+        if h < 4:
+            h = self.canvas.winfo_height()
+        if h < 4:
+            return
+        sc.place(relx=1.0, rely=0.0, relheight=1.0, anchor="ne", x=-2)
+        sc.lift()
+
+        thumb_h = max(24, int(h * (last - first)))
+        thumb_y  = int(h * first)
+        w = 5
+        x1, x2 = 2, 2 + w
+        y1, y2  = thumb_y + 2, thumb_y + thumb_h - 2
+        r = w // 2
+        c = "#555555"
+        if y2 - y1 > 2 * r:
+            sc.create_oval(x1, y1,       x2, y1 + 2*r, fill=c, outline="")
+            sc.create_rectangle(x1, y1 + r, x2, y2 - r, fill=c, outline="")
+            sc.create_oval(x1, y2 - 2*r, x2, y2,       fill=c, outline="")
+        else:
+            sc.create_oval(x1, y1, x2, max(y2, y1 + 2*r), fill=c, outline="")
+
+        if self._sb_hide_id:
+            sc.after_cancel(self._sb_hide_id)
+        self._sb_hide_id = sc.after(1200, self._hide_scrollbar)
+
+    def _hide_scrollbar(self):
+        self._sb_canvas.place_forget()
+        self._sb_hide_id = None
+
+    # ── 工具栏 hover 显示 / 隐藏 ─────────────────────────────────
+    def _bind_hover(self):
+        """给所有主要区域绑定 Enter/Leave，实现 hover 显示工具栏。"""
+        def on_enter(e):
+            if self._tb_hide_id:
+                self.win.after_cancel(self._tb_hide_id)
+                self._tb_hide_id = None
+            self._animate_tb(True)
+
+        def on_leave(e):
+            # 检查鼠标是否真的离开了窗口边界（而非在子控件间移动）
+            try:
+                wx = self.win.winfo_rootx()
+                wy = self.win.winfo_rooty()
+                ww = self.win.winfo_width()
+                wh = self.win.winfo_height()
+                if wx <= e.x_root <= wx + ww and wy <= e.y_root <= wy + wh:
+                    return
+            except Exception:
+                return
+            if self._tb_hide_id:
+                self.win.after_cancel(self._tb_hide_id)
+            self._tb_hide_id = self.win.after(
+                350, lambda: self._animate_tb(False))
+
+        targets = [self.win, self._list_outer, self.canvas,
+                   self.sf, self.tb, self._rsz_canvas]
+        targets += self._tb_widgets
+        for w in targets:
+            try:
+                w.bind("<Enter>", on_enter, add="+")
+                w.bind("<Leave>", on_leave, add="+")
+            except Exception:
+                pass
+
+    def _animate_tb(self, show: bool):
+        """启动工具栏滑入 / 滑出动画。"""
+        if self._tb_anim_id:
+            self.win.after_cancel(self._tb_anim_id)
+            self._tb_anim_id = None
+        target = 34 if show else 0
+        if self._tb_h == target:
+            return
+        if not show:
+            # 折叠时立即抹去所有颜色和文字，防止缩动过程中露出色条
+            self._set_tb_content_visible(False)
+        self._tb_step(target)
+
+    def _tb_step(self, target: int):
+        was_zero = (self._tb_h == 0)
+        step = 5
+        if target > self._tb_h:
+            self._tb_h = min(target, self._tb_h + step)
+            if was_zero:
+                # 展开第一帧：先恢复颜色，再让高度可见
+                self._set_tb_content_visible(True)
+        else:
+            self._tb_h = max(target, self._tb_h - step)
+        try:
+            self.tb.config(height=self._tb_h)
+        except Exception:
+            return
+        if self._tb_h != target:
+            self._tb_anim_id = self.win.after(
+                10, lambda: self._tb_step(target))
+
+    def _set_tb_content_visible(self, visible: bool):
+        """把工具栏所有控件颜色切换为可见/隐藏（不改变高度）。"""
+        if visible:
+            self.tb.config(bg=self._tbg)
+            self.rbar.config(bg=self._tbg)
+            for w in self._tb_widgets:
+                try:
+                    txt = w.cget("text")
+                    w.config(bg=self._tbg,
+                             fg=self._tbsep if txt == "│" else self._tbfg)
+                except Exception:
+                    pass
+        else:
+            bg = self._bg
+            self.tb.config(bg=bg)
+            self.rbar.config(bg=bg)
+            for w in self._tb_widgets:
+                try:
+                    w.config(bg=bg, fg=bg)
+                except Exception:
+                    pass
+
     # ════════════════════════════════════════════════════════════════
     # 弹出面板通用系统
     # ════════════════════════════════════════════════════════════════
+    def _monitor_workarea(self) -> tuple:
+        """返回当前便签窗口所在显示器的工作区 (left, top, right, bottom)。"""
+        try:
+            class RECT(ctypes.Structure):
+                _fields_ = [("left",  ctypes.c_long), ("top",    ctypes.c_long),
+                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+            class MONITORINFO(ctypes.Structure):
+                _fields_ = [("cbSize",    ctypes.c_ulong),
+                            ("rcMonitor", RECT), ("rcWork", RECT),
+                            ("dwFlags",   ctypes.c_ulong)]
+            hwnd = self.win.winfo_id()
+            hm   = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)
+            mi   = MONITORINFO()
+            mi.cbSize = ctypes.sizeof(MONITORINFO)
+            ctypes.windll.user32.GetMonitorInfoW(hm, ctypes.byref(mi))
+            r = mi.rcWork
+            return r.left, r.top, r.right, r.bottom
+        except Exception:
+            return (0, 0,
+                    self.win.winfo_screenwidth(),
+                    self.win.winfo_screenheight())
+
     def _open_popup(self, anchor: tk.Widget, attr: str, build_fn) -> None:
         existing = getattr(self, attr, None)
         if existing:
@@ -392,14 +555,18 @@ class StickyNote:
         card.pack(padx=1, pady=1, fill=tk.BOTH, expand=True)
         build_fn(card)
 
-        sw = self.win.winfo_screenwidth()
-        sh = self.win.winfo_screenheight()
+        # 覆盖整个虚拟桌面（兼容多显示器）
+        u32 = ctypes.windll.user32
+        vx = u32.GetSystemMetrics(76)   # SM_XVIRTUALSCREEN
+        vy = u32.GetSystemMetrics(77)   # SM_YVIRTUALSCREEN
+        vw = u32.GetSystemMetrics(78)   # SM_CXVIRTUALSCREEN
+        vh = u32.GetSystemMetrics(79)   # SM_CYVIRTUALSCREEN
         overlay = tk.Toplevel(self.win)
         overlay.overrideredirect(True)
         overlay.configure(bg="black")
         overlay.attributes("-alpha", 0.01)
         overlay.attributes("-topmost", False)
-        overlay.geometry(f"{sw}x{sh}+0+0")
+        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")
         overlay.lower(popup)
 
         def _close():
@@ -420,8 +587,10 @@ class StickyNote:
         ph = popup.winfo_reqheight()
         bx = anchor.winfo_rootx()
         by = anchor.winfo_rooty() + anchor.winfo_height() + 4
-        bx = min(bx, sw - pw - 6)
-        by = min(by, sh - ph - 6)
+        # 在当前显示器工作区内 clamp（修复跨屏幕弹窗错位）
+        ml, mt, mr, mb = self._monitor_workarea()
+        bx = max(ml, min(bx, mr - pw - 6))
+        by = max(mt, min(by, mb - ph - 6))
         popup.geometry(f"{pw}x{ph}+{bx}+{by}")
         popup.lift()
 
