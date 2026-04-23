@@ -1,7 +1,8 @@
 """
-便签小组件 v3
+SheepNote — 桌面便签小组件 v3
 架构：一个隐藏的 tk.Tk 主进程 + 多个 tk.Toplevel 便签窗口
 """
+import colorsys
 import tkinter as tk
 from tkinter import ttk
 import atexit, ctypes, json, os, sys
@@ -27,13 +28,11 @@ def _single_instance() -> bool:
         return False
     return True
 
-# ── 全局颜色 / 字体常量 ───────────────────────────────────────────
-BG_NOTE    = "#FFF9C4"          # 默认便签底色
-BG_TB      = "#F9A825"          # 工具栏琥珀色（固定不变）
+# ── 全局常量 ──────────────────────────────────────────────────────
+BG_NOTE    = "#FFF9C4"
 FG_TASK    = "#2D2D2D"
 FG_DONE    = "#AAAAAA"
 FG_HINT    = "#CCCCCC"
-FG_BTN     = "#5D4037"
 ACCENT     = "#3949AB"
 
 FS_DEF, FS_MIN, FS_MAX = 11, 9, 18
@@ -41,7 +40,7 @@ AL_DEF, AL_MIN          = 1.0, 0.3
 FONT_CB   = ("Segoe UI Symbol", 14)
 FONT_BOLD = ("Microsoft YaHei", 11, "bold")
 
-# ── 便签预设颜色（5 个）───────────────────────────────────────────
+# ── 便签预设颜色 + 对应工具栏色 ──────────────────────────────────
 NOTE_COLORS = [
     ("#FFF9C4", "暖黄"),
     ("#DBEAFE", "天蓝"),
@@ -49,6 +48,14 @@ NOTE_COLORS = [
     ("#FFE4E8", "樱粉"),
     ("#F3E8FF", "薰衣草"),
 ]
+# 预设便签色 → 工具栏色（手工调优）
+_PRESET_TB = {
+    "#fff9c4": "#F9A825",
+    "#dbeafe": "#2563EB",
+    "#dcfce7": "#16A34A",
+    "#ffe4e8": "#E11D48",
+    "#f3e8ff": "#9333EA",
+}
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -58,7 +65,7 @@ class App:
     def __init__(self):
         self.root = tk.Tk()
         self.root.withdraw()
-        self.root.title("便签管理器")
+        self.root.title("SheepNote")
         self.notes: list[StickyNote] = []
 
         self._show_ev = ctypes.windll.kernel32.CreateEventW(
@@ -132,29 +139,35 @@ class StickyNote:
     def __init__(self, master: tk.Tk, data: dict, app: App, offset: int = 0):
         self.app  = app
         self.win  = tk.Toplevel(master)
-        self.win.title("便签")
+        self.win.title("SheepNote")
         self.win.overrideredirect(True)
 
         self._dx = self._dy = 0
         self._rsx = self._rsy = self._rsw = self._rsh = 0
 
-        self.tasks:    list[dict] = data.get("tasks",     [])
-        self._topmost: bool  = data.get("topmost",   False)
-        self._fs:      int   = data.get("font_size",  FS_DEF)
-        self._alpha:   float = data.get("alpha",      AL_DEF)
-        self._bg:      str   = data.get("color",      BG_NOTE)
+        self.tasks:    list[dict] = data.get("tasks",    [])
+        self._topmost: bool  = data.get("topmost",  False)
+        self._fs:      int   = data.get("font_size", FS_DEF)
+        self._alpha:   float = data.get("alpha",     AL_DEF)
+        self._bg:      str   = data.get("color",     BG_NOTE)
         self._locked:  bool  = False
         self._saved_geo = data
         self._offset    = offset
 
-        self._compute_derived_colors()   # 计算 _bghv（hover色）
+        # 计算派生色（hover、工具栏）
+        self._bghv = self._tbg = self._tbfg = self._tbsep = ""
+        self._compute_derived_colors()
 
-        self._new_entry:    tk.Entry    | None = None
-        self._new_cb:       tk.Label    | None = None
-        self._fs_popup:     tk.Toplevel | None = None
-        self._al_popup:     tk.Toplevel | None = None
-        self._color_popup:  tk.Toplevel | None = None
-        self._list_popup:   tk.Toplevel | None = None
+        # 工具栏 widget 引用列表（用于换色）
+        self._tb_widgets: list[tk.Widget] = []
+
+        # 弹窗引用
+        self._new_entry:   tk.Entry    | None = None
+        self._new_cb:      tk.Label    | None = None
+        self._fs_popup:    tk.Toplevel | None = None
+        self._al_popup:    tk.Toplevel | None = None
+        self._color_popup: tk.Toplevel | None = None
+        self._list_popup:  tk.Toplevel | None = None
 
         self.win.configure(bg=self._bg)
         self.win.attributes("-topmost", self._topmost)
@@ -164,18 +177,64 @@ class StickyNote:
         self._refresh()
         self._apply_geo()
 
-    # ── 颜色工具 ──────────────────────────────────────────────────
+    # ── 颜色计算 ──────────────────────────────────────────────────
     def _compute_derived_colors(self):
-        """根据当前 _bg 计算 hover 色（略深 8%）。"""
-        h = self._bg.lstrip('#')
-        r = max(0, int(int(h[0:2], 16) * 0.92))
-        g = max(0, int(int(h[2:4], 16) * 0.92))
-        b = max(0, int(int(h[4:6], 16) * 0.92))
-        self._bghv = f"#{r:02x}{g:02x}{b:02x}"
+        """根据 _bg 计算 hover 色、工具栏色、工具栏文字色、分隔线色。"""
+        h  = self._bg.lstrip('#')
+        r8 = int(h[0:2], 16)
+        g8 = int(h[2:4], 16)
+        b8 = int(h[4:6], 16)
+
+        # hover：略深 8%
+        self._bghv = "#{:02x}{:02x}{:02x}".format(
+            max(0, int(r8 * 0.92)),
+            max(0, int(g8 * 0.92)),
+            max(0, int(b8 * 0.92)),
+        )
+
+        # 工具栏色：预设直接查表，自定义用 HSV 推算
+        lookup = _PRESET_TB.get(self._bg.lower())
+        if lookup:
+            self._tbg = lookup
+        else:
+            hue, sat, val = colorsys.rgb_to_hsv(r8/255, g8/255, b8/255)
+            new_s = min(1.0, sat * 3.2 + 0.40)
+            new_v = max(0.45, val * 0.64)
+            nr, ng, nb = colorsys.hsv_to_rgb(hue, new_s, new_v)
+            self._tbg = "#{:02x}{:02x}{:02x}".format(
+                int(nr*255), int(ng*255), int(nb*255))
+
+        # 工具栏文字：根据亮度选黑/白
+        th = self._tbg.lstrip('#')
+        tr, tg, tb = int(th[0:2], 16), int(th[2:4], 16), int(th[4:6], 16)
+        brightness = (tr*299 + tg*587 + tb*114) / 1000
+        self._tbfg  = "#FFFFFF" if brightness < 155 else "#3E2723"
+
+        # 分隔线：工具栏色提亮 25%
+        self._tbsep = "#{:02x}{:02x}{:02x}".format(
+            min(255, int(tr * 1.25)),
+            min(255, int(tg * 1.25)),
+            min(255, int(tb * 1.25)),
+        )
+
+    def _apply_tb_color(self):
+        """把当前工具栏色刷新到所有工具栏 widget 上。"""
+        self.tb.config(bg=self._tbg)
+        self.rbar.config(bg=self._tbg)
+        for w in self._tb_widgets:
+            try:
+                txt = w.cget("text")
+                if txt == "│":
+                    w.config(bg=self._tbg, fg=self._tbsep)
+                else:
+                    w.config(bg=self._tbg, fg=self._tbfg)
+            except Exception:
+                pass
 
     def _set_color(self, color: str):
         self._bg = color
         self._compute_derived_colors()
+        self._apply_tb_color()
         self.win.configure(bg=color)
         self._list_outer.configure(bg=color)
         self.canvas.configure(bg=color)
@@ -188,58 +247,55 @@ class StickyNote:
     # ════════════════════════════════════════════════════════════════
     def _build(self):
         # ── 工具栏 ─────────────────────────────────────────────────
-        self.tb = tk.Frame(self.win, bg=BG_TB, height=34)
+        self.tb = tk.Frame(self.win, bg=self._tbg, height=34)
         self.tb.pack(fill=tk.X)
         self.tb.pack_propagate(False)
 
         self.title_lbl = tk.Label(
-            self.tb, text="⠿  便签",
-            bg=BG_TB, fg=FG_BTN, font=FONT_BOLD, cursor="fleur"
+            self.tb, text="⠿  SheepNote",
+            bg=self._tbg, fg=self._tbfg, font=FONT_BOLD, cursor="fleur"
         )
         self.title_lbl.pack(side=tk.LEFT, padx=(8, 2))
+        self._tb_widgets.append(self.title_lbl)
 
-        self.list_btn = self._btn(self.tb, "📋", self._toggle_list_popup,
-                                  hover="#E65100")
+        self.list_btn = self._tbtn("📋", self._toggle_list_popup, hover="#E65100")
         self.list_btn.pack(side=tk.LEFT, padx=2)
 
-        self._btn(self.tb, "＋", self.app.new_note,
-                  hover="#43A047").pack(side=tk.LEFT, padx=2)
+        nb = self._tbtn("＋", self.app.new_note, hover="#43A047")
+        nb.pack(side=tk.LEFT, padx=2)
 
-        # 右侧按钮区
-        rbar = tk.Frame(self.tb, bg=BG_TB)
-        rbar.pack(side=tk.RIGHT, padx=4)
+        # 右侧
+        self.rbar = tk.Frame(self.tb, bg=self._tbg)
+        self.rbar.pack(side=tk.RIGHT, padx=4)
 
-        # × 隐藏所有
-        self._btn(rbar, "×", self.app.hide_all,
-                  hover="#E53935").pack(side=tk.RIGHT, padx=1)
-        # 🔒 锁定
-        self.lock_btn = self._btn(rbar, "🔒", self._toggle_lock, hover=ACCENT)
+        self._tbtn("×", self.app.hide_all, hover="#E53935", parent=self.rbar).pack(
+            side=tk.RIGHT, padx=1)
+
+        self.lock_btn = self._tbtn("🔒", self._toggle_lock, hover=ACCENT,
+                                   parent=self.rbar)
         self.lock_btn.pack(side=tk.RIGHT, padx=1)
-        # 📌 置顶
-        self.pin_btn = self._btn(
-            rbar, "📍" if self._topmost else "📌",
-            self._toggle_topmost, hover="#F57F17")
+
+        self.pin_btn = self._tbtn("📍" if self._topmost else "📌",
+                                  self._toggle_topmost, hover="#F57F17",
+                                  parent=self.rbar)
         self.pin_btn.pack(side=tk.RIGHT, padx=1)
 
-        self._sep(rbar)
+        self._sep()
 
-        # 🎨 颜色
-        self.color_btn = self._btn(rbar, "🎨", self._toggle_color_popup,
-                                   hover="#FB8C00")
+        self.color_btn = self._tbtn("🎨", self._toggle_color_popup,
+                                    hover="#FB8C00", parent=self.rbar)
         self.color_btn.pack(side=tk.RIGHT, padx=1)
 
-        self._sep(rbar)
+        self._sep()
 
-        # ◑ 透明度
-        self.al_btn = self._btn(rbar, "◑", self._toggle_alpha_popup,
-                                hover="#5C6BC0")
+        self.al_btn = self._tbtn("◑", self._toggle_alpha_popup,
+                                 hover="#5C6BC0", parent=self.rbar)
         self.al_btn.pack(side=tk.RIGHT, padx=1)
 
-        self._sep(rbar)
+        self._sep()
 
-        # A 字号
-        self.fs_btn = self._btn(rbar, "A", self._toggle_fs_popup,
-                                hover="#00897B")
+        self.fs_btn = self._tbtn("A", self._toggle_fs_popup,
+                                 hover="#00897B", parent=self.rbar)
         self.fs_btn.pack(side=tk.RIGHT, padx=1)
 
         for w in (self.tb, self.title_lbl):
@@ -254,7 +310,7 @@ class StickyNote:
                                 highlightthickness=0)
         self._sb = ttk.Scrollbar(self._list_outer, orient="vertical",
                                  command=self.canvas.yview)
-        self.sf  = tk.Frame(self.canvas, bg=self._bg)
+        self.sf = tk.Frame(self.canvas, bg=self._bg)
 
         self.sf.bind("<Configure>",
                      lambda e: self.canvas.configure(
@@ -282,33 +338,35 @@ class StickyNote:
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self._sb.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # ── 底部缩放条 ─────────────────────────────────────────────
-        bot = tk.Frame(self.win, bg=BG_TB, height=6, cursor="sizing")
-        bot.pack(fill=tk.X)
-        bot.bind("<ButtonPress-1>", self._resize_start)
-        bot.bind("<B1-Motion>",     self._resize_move)
+        # ── 底部缩放条（颜色同工具栏）─────────────────────────────
+        self._bot = tk.Frame(self.win, bg=self._tbg, height=6, cursor="sizing")
+        self._bot.pack(fill=tk.X)
+        self._bot.bind("<ButtonPress-1>", self._resize_start)
+        self._bot.bind("<B1-Motion>",     self._resize_move)
+        self._tb_widgets.append(self._bot)   # 随工具栏一起换色
 
-    # ── 工具栏按钮工厂 ────────────────────────────────────────────
-    def _btn(self, parent, text, cmd, bg=None, hover=None, w=None) -> tk.Label:
-        kw = dict(text=text, bg=bg or BG_TB, fg=FG_BTN,
-                  font=("Microsoft YaHei", 9), cursor="hand2", bd=0)
-        if w:
-            kw["width"] = w
-        lbl = tk.Label(parent, **kw)
-        _bg, _hv = bg or BG_TB, hover or "#F0C060"
+    # ── 工具栏按钮工厂（toolbar 专用）────────────────────────────
+    def _tbtn(self, text, cmd, hover=None, parent=None) -> tk.Label:
+        p   = parent if parent is not None else self.tb
+        lbl = tk.Label(p, text=text, bg=self._tbg, fg=self._tbfg,
+                       font=("Microsoft YaHei", 9), cursor="hand2", bd=0)
+        _hv = hover or "#F0C060"
         lbl.bind("<Button-1>", lambda e: cmd())
         lbl.bind("<Enter>",    lambda e: lbl.config(bg=_hv))
-        lbl.bind("<Leave>",    lambda e: lbl.config(bg=_bg))
+        lbl.bind("<Leave>",    lambda e: lbl.config(bg=self._tbg,
+                                                     fg=self._tbfg))
+        self._tb_widgets.append(lbl)
         return lbl
 
-    def _sep(self, parent):
-        tk.Label(parent, text="│", bg=BG_TB, fg="#D4A800").pack(
-            side=tk.RIGHT, padx=2)
+    def _sep(self):
+        lbl = tk.Label(self.rbar, text="│", bg=self._tbg, fg=self._tbsep)
+        lbl.pack(side=tk.RIGHT, padx=2)
+        self._tb_widgets.append(lbl)
 
     # ════════════════════════════════════════════════════════════════
     # 弹出面板通用系统
     # ════════════════════════════════════════════════════════════════
-    def _open_popup(self, anchor: tk.Label, attr: str, build_fn) -> None:
+    def _open_popup(self, anchor: tk.Widget, attr: str, build_fn) -> None:
         existing = getattr(self, attr, None)
         if existing:
             try:
@@ -332,7 +390,6 @@ class StickyNote:
 
         card = tk.Frame(popup, bg="#FFFFFF", padx=16, pady=14)
         card.pack(padx=1, pady=1, fill=tk.BOTH, expand=True)
-
         build_fn(card)
 
         sw = self.win.winfo_screenwidth()
@@ -377,8 +434,7 @@ class StickyNote:
                                fg="#212121",
                                font=("Microsoft YaHei", 26, "bold"), width=3)
             val_lbl.pack(pady=(4, 6))
-            rng = tk.Frame(card, bg="#FFFFFF")
-            rng.pack(fill=tk.X)
+            rng = tk.Frame(card, bg="#FFFFFF"); rng.pack(fill=tk.X)
             tk.Label(rng, text=f"A  {FS_MIN}pt", bg="#FFFFFF", fg="#BDBDBD",
                      font=("Microsoft YaHei", 8)).pack(side=tk.LEFT)
             tk.Label(rng, text=f"{FS_MAX}pt  A", bg="#FFFFFF", fg="#BDBDBD",
@@ -387,12 +443,11 @@ class StickyNote:
             def on_change(v):
                 nv = int(float(v))
                 if nv != self._fs:
-                    self._fs = nv
-                    val_lbl.config(text=str(nv))
+                    self._fs = nv; val_lbl.config(text=str(nv))
                     self._refresh(); self.app.save()
             ttk.Scale(card, from_=FS_MIN, to=FS_MAX, orient=tk.HORIZONTAL,
-                      length=180, variable=var, command=on_change).pack(
-                          pady=(2, 0))
+                      length=180, variable=var,
+                      command=on_change).pack(pady=(2, 0))
         self._open_popup(self.fs_btn, "_fs_popup", build)
 
     # ── 透明度弹出 ────────────────────────────────────────────────
@@ -400,24 +455,22 @@ class StickyNote:
         def build(card):
             tk.Label(card, text="便签透明度", bg="#FFFFFF", fg="#9E9E9E",
                      font=("Microsoft YaHei", 8)).pack(anchor="w")
-            val_lbl = tk.Label(card, text=f"{int(self._alpha * 100)}%",
+            val_lbl = tk.Label(card, text=f"{int(self._alpha*100)}%",
                                bg="#FFFFFF", fg="#212121",
                                font=("Microsoft YaHei", 26, "bold"), width=4)
             val_lbl.pack(pady=(4, 6))
-            rng = tk.Frame(card, bg="#FFFFFF")
-            rng.pack(fill=tk.X)
+            rng = tk.Frame(card, bg="#FFFFFF"); rng.pack(fill=tk.X)
             tk.Label(rng, text=f"{int(AL_MIN*100)}%", bg="#FFFFFF",
                      fg="#BDBDBD",
                      font=("Microsoft YaHei", 8)).pack(side=tk.LEFT)
             tk.Label(rng, text="100%", bg="#FFFFFF", fg="#BDBDBD",
                      font=("Microsoft YaHei", 8)).pack(side=tk.RIGHT)
-            var = tk.IntVar(value=int(self._alpha * 100))
+            var = tk.IntVar(value=int(self._alpha*100))
             def on_change(v):
                 nv_pct = int(float(v))
-                nv = max(AL_MIN, round(nv_pct / 100, 2))
+                nv = max(AL_MIN, round(nv_pct/100, 2))
                 if nv != self._alpha:
-                    self._alpha = nv
-                    val_lbl.config(text=f"{nv_pct}%")
+                    self._alpha = nv; val_lbl.config(text=f"{nv_pct}%")
                     self.win.attributes("-alpha", nv); self.app.save()
             ttk.Scale(card, from_=int(AL_MIN*100), to=100,
                       orient=tk.HORIZONTAL, length=180, variable=var,
@@ -430,18 +483,12 @@ class StickyNote:
             tk.Label(card, text="便签颜色", bg="#FFFFFF", fg="#9E9E9E",
                      font=("Microsoft YaHei", 8)).pack(anchor="w",
                                                        pady=(0, 10))
-
-            # ── 预设色块 ──────────────────────────────────────────
-            swatch_row = tk.Frame(card, bg="#FFFFFF")
-            swatch_row.pack()
+            row = tk.Frame(card, bg="#FFFFFF"); row.pack()
 
             for hex_col, name in NOTE_COLORS:
-                cf = tk.Frame(swatch_row, bg="#FFFFFF", cursor="hand2")
+                cf = tk.Frame(row, bg="#FFFFFF", cursor="hand2")
                 cf.pack(side=tk.LEFT, padx=5)
-
                 selected = self._bg.lower() == hex_col.lower()
-
-                # 外框（选中时加深边框）
                 outer_bd = tk.Frame(
                     cf,
                     bg="#333333" if selected else "#DDDDDD",
@@ -450,18 +497,13 @@ class StickyNote:
                     cursor="hand2"
                 )
                 outer_bd.pack()
-
-                swatch = tk.Label(outer_bd, bg=hex_col,
-                                  width=4, height=2, cursor="hand2")
+                swatch = tk.Label(outer_bd, bg=hex_col, width=4, height=2,
+                                  cursor="hand2")
                 swatch.pack()
-
-                # 选中时右下角打勾
-                if selected:
-                    tk.Label(cf, text="✓", bg="#FFFFFF", fg="#333333",
-                             font=("Microsoft YaHei", 7)).pack()
-                else:
-                    tk.Label(cf, text=name, bg="#FFFFFF", fg="#9E9E9E",
-                             font=("Microsoft YaHei", 7)).pack()
+                tk.Label(cf, text="✓" if selected else name,
+                         bg="#FFFFFF",
+                         fg="#333333" if selected else "#9E9E9E",
+                         font=("Microsoft YaHei", 7)).pack()
 
                 def _pick(e, c=hex_col):
                     self._set_color(c)
@@ -470,28 +512,21 @@ class StickyNote:
                         try: p.destroy()
                         except Exception: pass
 
-                swatch.bind("<Button-1>", _pick)
-                outer_bd.bind("<Button-1>", _pick)
-                cf.bind("<Button-1>", _pick)
-
-                # 悬停预览
+                for w in (swatch, outer_bd, cf):
+                    w.bind("<Button-1>", _pick)
                 swatch.bind("<Enter>",
                             lambda e, f=outer_bd: f.config(bg="#555555"))
                 swatch.bind("<Leave>",
                             lambda e, f=outer_bd, sel=selected:
                             f.config(bg="#333333" if sel else "#DDDDDD"))
 
-            # ── 自定义颜色 ────────────────────────────────────────
             tk.Frame(card, bg="#F0F0F0", height=1).pack(
                 fill=tk.X, pady=(12, 8))
 
             def open_picker():
                 from tkinter.colorchooser import askcolor
-                result = askcolor(
-                    color=self._bg,
-                    title="选择便签颜色",
-                    parent=self.win
-                )
+                result = askcolor(color=self._bg, title="选择便签颜色",
+                                  parent=self.win)
                 if result[1]:
                     self._set_color(result[1])
                     p = getattr(self, "_color_popup", None)
@@ -501,11 +536,9 @@ class StickyNote:
 
             custom_f = tk.Frame(card, bg="#F7F7F7", cursor="hand2")
             custom_f.pack(fill=tk.X)
-            custom_lbl = tk.Label(
-                custom_f, text="🎨  自定义颜色…",
-                bg="#F7F7F7", fg="#424242",
-                font=("Microsoft YaHei", 9), pady=7
-            )
+            custom_lbl = tk.Label(custom_f, text="🎨  自定义颜色…",
+                                  bg="#F7F7F7", fg="#424242",
+                                  font=("Microsoft YaHei", 9), pady=7)
             custom_lbl.pack()
             for w in (custom_f, custom_lbl):
                 w.bind("<Button-1>", lambda e: open_picker())
@@ -526,19 +559,15 @@ class StickyNote:
     def _toggle_list_popup(self):
         def build(card):
             notes = self.app.notes
-            hdr = tk.Frame(card, bg="#FFFFFF")
-            hdr.pack(fill=tk.X, pady=(0, 10))
+            hdr = tk.Frame(card, bg="#FFFFFF"); hdr.pack(fill=tk.X, pady=(0,10))
             tk.Label(hdr, text="便签列表", bg="#FFFFFF", fg="#424242",
                      font=("Microsoft YaHei", 11, "bold")).pack(side=tk.LEFT)
             tk.Label(hdr, text=f"{len(notes)} 个", bg="#FFFFFF", fg="#9E9E9E",
                      font=("Microsoft YaHei", 9)).pack(side=tk.RIGHT, pady=2)
-
             for i, note in enumerate(notes):
                 self._list_row(card, i, note)
-
             tk.Frame(card, bg="#F0F0F0", height=1).pack(fill=tk.X,
                                                          pady=(10, 6))
-
             new_f = tk.Frame(card, bg="#F7F7F7", cursor="hand2")
             new_f.pack(fill=tk.X)
             new_lbl = tk.Label(new_f, text="＋  新建便签", bg="#F7F7F7",
@@ -567,17 +596,14 @@ class StickyNote:
         label_text = self._note_label(idx, note)
         count_text = (f"{task_count} 个任务  ✓{done_count}"
                       if task_count else "暂无任务")
-
         ROW_BG  = "#FFFDE7" if visible else "#FAFAFA"
         ROW_HOV = "#FFF9C4" if visible else "#F0F0F0"
 
-        row = tk.Frame(parent, bg=ROW_BG, cursor="arrow")
+        row    = tk.Frame(parent, bg=ROW_BG, cursor="arrow")
         row.pack(fill=tk.X, pady=2)
-
-        border = tk.Frame(row, bg=BG_TB if visible else "#BDBDBD", width=4)
+        border = tk.Frame(row, bg=note._tbg if visible else "#BDBDBD", width=4)
         border.pack(side=tk.LEFT, fill=tk.Y)
-
-        inner = tk.Frame(row, bg=ROW_BG, padx=10, pady=8)
+        inner  = tk.Frame(row, bg=ROW_BG, padx=10, pady=8)
         inner.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         name_fg  = "#212121" if visible else "#9E9E9E"
@@ -588,25 +614,23 @@ class StickyNote:
         tk.Label(inner, text=count_text, bg=ROW_BG, fg="#BDBDBD",
                  font=("Microsoft YaHei", 8), anchor="w").pack(anchor="w")
 
-        BTN_BG  = BG_TB    if visible else "#E0E0E0"
-        BTN_FG  = FG_BTN   if visible else "#9E9E9E"
         BTN_TXT = "● 显示" if visible else "○ 隐藏"
-
+        BTN_BG  = note._tbg if visible else "#E0E0E0"
+        BTN_FG  = note._tbfg if visible else "#9E9E9E"
         tog = tk.Label(row, text=BTN_TXT, bg=BTN_BG, fg=BTN_FG,
                        font=("Microsoft YaHei", 8), padx=8, pady=3,
                        cursor="hand2", relief="flat")
         tog.pack(side=tk.RIGHT, padx=(6, 10), pady=8)
-
         _vis = [visible]
 
         def toggle_vis():
             _vis[0] = not _vis[0]
             if _vis[0]:
                 note.win.deiconify()
-                row.config(bg="#FFFDE7"); border.config(bg=BG_TB)
+                row.config(bg="#FFFDE7"); border.config(bg=note._tbg)
                 inner.config(bg="#FFFDE7")
                 for ch in inner.winfo_children(): ch.config(bg="#FFFDE7")
-                tog.config(text="● 显示", bg=BG_TB, fg=FG_BTN)
+                tog.config(text="● 显示", bg=note._tbg, fg=note._tbfg)
             else:
                 note.win.withdraw()
                 row.config(bg="#FAFAFA"); border.config(bg="#BDBDBD")
@@ -618,7 +642,7 @@ class StickyNote:
         tog.bind("<Enter>", lambda e, t=tog, v=_vis:
                  t.config(bg="#FFB300" if v[0] else "#D5D5D5"))
         tog.bind("<Leave>", lambda e, t=tog, v=_vis:
-                 t.config(bg=BG_TB if v[0] else "#E0E0E0"))
+                 t.config(bg=note._tbg if v[0] else "#E0E0E0"))
 
         def hl_on(e):
             row.config(bg=ROW_HOV); inner.config(bg=ROW_HOV)
@@ -640,43 +664,34 @@ class StickyNote:
     # 任务列表渲染
     # ════════════════════════════════════════════════════════════════
     def _f(self)      -> tuple: return ("Microsoft YaHei", self._fs)
-    def _f_done(self) -> tuple: return ("Microsoft YaHei", self._fs,
-                                        "overstrike")
+    def _f_done(self) -> tuple: return ("Microsoft YaHei", self._fs, "overstrike")
 
     def _refresh(self, focus_new=False):
         for w in self.sf.winfo_children():
             w.destroy()
         self._new_entry = self._new_cb = None
-
         for i, task in enumerate(self.tasks):
             self._make_row(i, task)
-
         if not self._locked:
             self._new_entry = self._make_new_row()
-
         if focus_new and self._new_entry:
             self.win.after(30, self._new_entry.focus_set)
 
     def _make_row(self, idx: int, task: dict):
         done        = task["done"]
         interactive = not self._locked
-        bg          = self._bg
-        bghv        = self._bghv
+        bg, bghv    = self._bg, self._bghv
 
-        outer = tk.Frame(self.sf, bg=bg)
-        outer.pack(fill=tk.X)
-        inner = tk.Frame(outer, bg=bg, pady=4)
-        inner.pack(fill=tk.X, padx=8)
+        outer = tk.Frame(self.sf, bg=bg); outer.pack(fill=tk.X)
+        inner = tk.Frame(outer, bg=bg, pady=4); inner.pack(fill=tk.X, padx=8)
 
-        def hl_on(e,  o=outer, i=inner):
-            o.config(bg=bghv); i.config(bg=bghv)
-        def hl_off(e, o=outer, i=inner):
-            o.config(bg=bg);   i.config(bg=bg)
+        def hl_on(e,  o=outer, i=inner): o.config(bg=bghv); i.config(bg=bghv)
+        def hl_off(e, o=outer, i=inner): o.config(bg=bg);   i.config(bg=bg)
 
         cb_text = "☑" if done else "☐"
         cb_fg   = "#4CAF50" if done else "#AAAAAA"
-        cb = tk.Label(inner, text=cb_text, fg=cb_fg, bg=bg,
-                      font=FONT_CB, cursor="hand2" if interactive else "arrow")
+        cb = tk.Label(inner, text=cb_text, fg=cb_fg, bg=bg, font=FONT_CB,
+                      cursor="hand2" if interactive else "arrow")
         cb.pack(side=tk.LEFT, padx=(0, 5))
         if interactive:
             cb.bind("<Button-1>", lambda e, i=idx: self._toggle(i))
@@ -685,8 +700,8 @@ class StickyNote:
         if done or not interactive:
             font = self._f_done() if done else self._f()
             fg   = FG_DONE if done else FG_TASK
-            lbl  = tk.Label(inner, text=task["text"], bg=bg,
-                            fg=fg, font=font, anchor="w", justify=tk.LEFT)
+            lbl  = tk.Label(inner, text=task["text"], bg=bg, fg=fg,
+                            font=font, anchor="w", justify=tk.LEFT)
             lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
             if interactive:
                 lbl.bind("<Button-1>", lambda e, i=idx: self._toggle(i))
@@ -697,9 +712,8 @@ class StickyNote:
                            insertbackground=FG_TASK)
             ent.insert(0, task["text"])
             ent.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            ent.bind("<FocusOut>",
-                     lambda e, i=idx: self._save_text(i, e.widget))
-            ent.bind("<Return>", lambda e: self._focus_new())
+            ent.bind("<FocusOut>", lambda e, i=idx: self._save_text(i, e.widget))
+            ent.bind("<Return>",   lambda e: self._focus_new())
             ent.bind("<Enter>", hl_on); ent.bind("<Leave>", hl_off)
 
         if interactive:
@@ -707,19 +721,15 @@ class StickyNote:
                          font=("Microsoft YaHei", 11), cursor="hand2")
             d.pack(side=tk.RIGHT)
             d.bind("<Button-1>", lambda e, i=idx: self._delete(i))
-            d.bind("<Enter>",
-                   lambda e, b=d: b.config(fg="#E53935", bg=bghv))
-            d.bind("<Leave>",
-                   lambda e, b=d: b.config(fg="#DDDDDD", bg=bg))
+            d.bind("<Enter>", lambda e, b=d: b.config(fg="#E53935", bg=bghv))
+            d.bind("<Leave>", lambda e, b=d: b.config(fg="#DDDDDD", bg=bg))
 
         inner.bind("<Enter>", hl_on); inner.bind("<Leave>", hl_off)
 
     def _make_new_row(self) -> tk.Entry:
         bg = self._bg
-        outer = tk.Frame(self.sf, bg=bg)
-        outer.pack(fill=tk.X)
-        inner = tk.Frame(outer, bg=bg, pady=4)
-        inner.pack(fill=tk.X, padx=8)
+        outer = tk.Frame(self.sf, bg=bg); outer.pack(fill=tk.X)
+        inner = tk.Frame(outer, bg=bg, pady=4); inner.pack(fill=tk.X, padx=8)
 
         self._new_cb = tk.Label(inner, text="☐", bg=bg, fg=FG_HINT,
                                 font=FONT_CB)
@@ -730,7 +740,6 @@ class StickyNote:
                        insertbackground=FG_TASK)
         ent.insert(0, "添加新任务…")
         ent.pack(side=tk.LEFT, fill=tk.X, expand=True)
-
         ent.bind("<FocusIn>",  lambda e: self._new_in(ent))
         ent.bind("<FocusOut>", lambda e: self._new_out(ent))
         ent.bind("<Return>",   lambda e: self._add(ent))
@@ -744,9 +753,7 @@ class StickyNote:
 
     def _new_out(self, e: tk.Entry):
         if not e.get().strip():
-            e.delete(0, tk.END)
-            e.insert(0, "添加新任务…")
-            e.config(fg=FG_HINT)
+            e.delete(0, tk.END); e.insert(0, "添加新任务…"); e.config(fg=FG_HINT)
             if self._new_cb: self._new_cb.config(fg=FG_HINT)
 
     def _focus_new(self):
@@ -791,10 +798,10 @@ class StickyNote:
         self._locked = not self._locked
         if self._locked:
             self.lock_btn.config(bg=ACCENT)
-            self.win.attributes("-alpha",
-                                max(AL_MIN, round(self._alpha - 0.2, 1)))
+            self.win.attributes("-alpha", max(AL_MIN,
+                                             round(self._alpha - 0.2, 1)))
         else:
-            self.lock_btn.config(bg=BG_TB)
+            self.lock_btn.config(bg=self._tbg)
             self.win.attributes("-alpha", self._alpha)
         self._refresh()
 
@@ -804,8 +811,8 @@ class StickyNote:
     def _toggle_topmost(self):
         self._topmost = not self._topmost
         self.win.attributes("-topmost", self._topmost)
-        self.pin_btn.config(
-            text="📍" if self._topmost else "📌", bg=BG_TB)
+        self.pin_btn.config(text="📍" if self._topmost else "📌",
+                            bg=self._tbg)
         self.app.save()
 
     def _drag_start(self, e): self._dx, self._dy = e.x, e.y
