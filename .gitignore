@@ -5,6 +5,7 @@ notes_data.json
 build/
 dist/
 *.spec
+*.exe
 __pycache__/
 *.pyc
 
