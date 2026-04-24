@@ -7,3 +7,6 @@ dist/
 *.spec
 __pycache__/
 *.pyc
+
+# IDE / 工具
+.claude/

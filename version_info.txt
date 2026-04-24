@@ -1,7 +1,8 @@
+# -*- coding: utf-8 -*-
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(3, 0, 0, 0),
-    prodvers=(3, 0, 0, 0),
+    filevers=(4, 1, 0, 0),
+    prodvers=(4, 1, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +17,12 @@ VSVersionInfo(
           u'080404b0',
           [StringStruct(u'CompanyName', u'大绵羊'),
            StringStruct(u'FileDescription', u'SheepNote'),
-           StringStruct(u'FileVersion', u'3.0.0.0'),
+           StringStruct(u'FileVersion', u'4.1.0.0'),
            StringStruct(u'InternalName', u'SheepNote'),
            StringStruct(u'LegalCopyright', u'© 大绵羊'),
            StringStruct(u'OriginalFilename', u'SheepNote.exe'),
            StringStruct(u'ProductName', u'SheepNote'),
-           StringStruct(u'ProductVersion', u'3.0.0.0')])
+           StringStruct(u'ProductVersion', u'4.1.0.0')])
       ]
     ),
     VarFileInfo([VarStruct(u'Translation', [0x0804, 1200])])
