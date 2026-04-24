@@ -701,6 +701,7 @@ class StickyNote:
         self._tb_widgets: list[tk.Widget] = []
         self._new_entry:   tk.Entry    | None = None
         self._new_cb:      tk.Label    | None = None
+        self._new_outer:   tk.Frame    | None = None
         self._fs_popup:    tk.Toplevel | None = None
         self._al_popup:    tk.Toplevel | None = None
         self._color_popup: tk.Toplevel | None = None
@@ -1189,9 +1190,32 @@ class StickyNote:
         target = TB_HEIGHT if show else 0
         if self._tb_h == target:
             return
-        if not show:
+        if show:
+            self._show_new_row()
+        else:
+            self._hide_new_row()
             self._set_tb_content_visible(False)
         self._tb_step(target)
+
+    def _show_new_row(self):
+        try:
+            if self._new_outer and self._new_outer.winfo_exists():
+                self._new_outer.pack(fill=tk.X)
+        except tk.TclError:
+            pass
+
+    def _hide_new_row(self):
+        if self._new_entry:
+            try:
+                if self.win.focus_get() == self._new_entry:
+                    return
+            except Exception:
+                pass
+        try:
+            if self._new_outer and self._new_outer.winfo_exists():
+                self._new_outer.pack_forget()
+        except tk.TclError:
+            pass
 
     def _tb_step(self, target: int):
         was_zero = (self._tb_h == 0)
@@ -1780,6 +1804,10 @@ class StickyNote:
         bg = self._bg
         outer = tk.Frame(self.sf, bg=bg); outer.pack(fill=tk.X)
         inner = tk.Frame(outer, bg=bg, pady=SP1); inner.pack(fill=tk.X, padx=SP2)
+        self._new_outer = outer
+        # 工具栏隐藏时默认不可见，hover 后随工具栏一起显示
+        if self._tb_h == 0:
+            outer.pack_forget()
 
         self._new_cb = tk.Label(inner, text="☐", bg=bg, fg=FG_HINT, font=FONT_CB)
         self._new_cb.pack(side=tk.LEFT, padx=(0, SP1+1))
