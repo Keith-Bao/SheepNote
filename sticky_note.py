@@ -8,13 +8,19 @@ Apple HIG 全面优化：
   v4.1 修复   : 滚轮泄漏 / Mutex 释放 / Toast 状态机 / 托盘线程同步 /
                _refresh 防抖 / 确认框崩溃 / pending-delete 并发 /
                列表弹窗状态 / HWND 校验 / 删除时资源清理
+  跨平台      : Windows (Win32 原生) / macOS (pystray + socket IPC)
 """
 import colorsys
 import tkinter as tk
 from tkinter import ttk
 import tkinter.font as tkFont
 import atexit, ctypes, json, os, sys, threading
-from ctypes import wintypes
+
+_IS_WIN = sys.platform == "win32"
+_IS_MAC = sys.platform == "darwin"
+
+if _IS_WIN:
+    from ctypes import wintypes
 
 # ── 路径（兼容 PyInstaller）────────────────────────────────────────
 if getattr(sys, "frozen", False):
@@ -23,10 +29,14 @@ else:
     _BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_FILE = os.path.join(_BASE, "notes_data.json")
 
-# ── 单实例 Mutex + IPC 唤醒事件 ───────────────────────────────────
-_MUTEX      = "StickyNoteApp_v3_SingleInstance"
-_SHOW_EVENT = "StickyNoteApp_v3_ShowAll"
-_MUTEX_HANDLE: int = 0          # B: 保存句柄以便 atexit 释放
+# ════════════════════════════════════════════════════════════════════
+# 单实例 + IPC（平台分支）
+# ════════════════════════════════════════════════════════════════════
+
+# ── Windows：Mutex + Named Event ──────────────────────────────────
+_MUTEX        = "StickyNoteApp_v3_SingleInstance"
+_SHOW_EVENT   = "StickyNoteApp_v3_ShowAll"
+_MUTEX_HANDLE: int = 0
 
 def _single_instance() -> bool:
     global _MUTEX_HANDLE
@@ -43,7 +53,58 @@ def _release_mutex():
     if _MUTEX_HANDLE:
         ctypes.windll.kernel32.CloseHandle(_MUTEX_HANDLE)
 
-atexit.register(_release_mutex)
+if _IS_WIN:
+    atexit.register(_release_mutex)
+
+# ── macOS / Linux：Unix socket IPC ────────────────────────────────
+_MAC_SOCK_PATH = "/tmp/sheepnote_v4_1.sock"
+_mac_server_sock = None          # 主实例持有的监听 socket
+
+def _single_instance_mac() -> bool:
+    """返回 True 表示当前是第一个实例。"""
+    global _mac_server_sock
+    import socket as _sock_mod
+
+    # 先尝试连接已有实例
+    try:
+        s = _sock_mod.socket(_sock_mod.AF_UNIX, _sock_mod.SOCK_STREAM)
+        s.settimeout(1.0)
+        s.connect(_MAC_SOCK_PATH)
+        s.sendall(b"show")
+        s.close()
+        return False                 # 另一个实例已在运行
+    except OSError:
+        pass                         # 没有实例在监听
+
+    # 清理残留 socket 文件
+    try:
+        os.unlink(_MAC_SOCK_PATH)
+    except OSError:
+        pass
+
+    # 启动监听
+    try:
+        _mac_server_sock = _sock_mod.socket(_sock_mod.AF_UNIX, _sock_mod.SOCK_STREAM)
+        _mac_server_sock.bind(_MAC_SOCK_PATH)
+        _mac_server_sock.listen(1)
+        _mac_server_sock.setblocking(False)
+    except OSError:
+        pass   # 无法创建 socket，宽松处理：允许启动
+    return True
+
+def _cleanup_mac_ipc():
+    global _mac_server_sock
+    if _mac_server_sock:
+        try: _mac_server_sock.close()
+        except OSError: pass
+        _mac_server_sock = None
+    try:
+        os.unlink(_MAC_SOCK_PATH)
+    except OSError:
+        pass
+
+if not _IS_WIN:
+    atexit.register(_cleanup_mac_ipc)
 
 # ════════════════════════════════════════════════════════════════════
 # 多语言字符串
@@ -162,12 +223,19 @@ ACCENT_LIGHT = "#7986CB"      # Undo 按钮用
 COLOR_DANGER = "#E53935"
 COLOR_SUCCESS= "#43A047"
 
-# P1: 统一字体 Token
-FONT_BODY      = ("Microsoft YaHei", 11)
-FONT_SMALL     = ("Microsoft YaHei", 9)
-FONT_TITLE     = ("Microsoft YaHei", 12, "bold")
-FONT_POPUP_VAL = ("Microsoft YaHei", 24, "bold")
-FONT_CB        = ("Segoe UI Symbol", 14)
+# P1: 统一字体 Token（平台分支）
+if _IS_MAC:
+    FONT_BODY      = ("PingFang SC", 13)
+    FONT_SMALL     = ("PingFang SC", 11)
+    FONT_TITLE     = ("PingFang SC", 14, "bold")
+    FONT_POPUP_VAL = ("PingFang SC", 24, "bold")
+    FONT_CB        = ("Apple Color Emoji", 16)
+else:
+    FONT_BODY      = ("Microsoft YaHei", 11)
+    FONT_SMALL     = ("Microsoft YaHei", 9)
+    FONT_TITLE     = ("Microsoft YaHei", 12, "bold")
+    FONT_POPUP_VAL = ("Microsoft YaHei", 24, "bold")
+    FONT_CB        = ("Segoe UI Symbol", 14)
 
 # P1: 统一间距 Token（4px 网格）
 SP1, SP2, SP3, SP4 = 4, 8, 12, 16
@@ -217,11 +285,13 @@ class App:
         self.root.title("SheepNote")
         self.notes: list[StickyNote] = []
 
-        self._show_ev = ctypes.windll.kernel32.CreateEventW(
-            None, False, False, _SHOW_EVENT)
-
-        self._tray_hwnd:  int | None    = None   # D: 初始化为 None
-        self._tray_ready: threading.Event = threading.Event()  # D: 同步托盘线程
+        if _IS_WIN:
+            self._show_ev     = ctypes.windll.kernel32.CreateEventW(
+                None, False, False, _SHOW_EVENT)
+            self._tray_hwnd:  int | None      = None
+            self._tray_ready: threading.Event = threading.Event()
+        else:
+            self._pystray_icon = None          # macOS pystray 实例
 
         data      = self._read()
         self.lang = data.get("lang", "zh")
@@ -235,8 +305,24 @@ class App:
         self._setup_tray()
 
     def _poll_show_event(self):
-        if ctypes.windll.kernel32.WaitForSingleObject(self._show_ev, 0) == 0:
-            self.show_all()
+        if _IS_WIN:
+            if ctypes.windll.kernel32.WaitForSingleObject(self._show_ev, 0) == 0:
+                self.show_all()
+        else:
+            # 非阻塞检查 Unix socket，收到 show 消息就唤醒所有便签
+            if _mac_server_sock:
+                import select
+                try:
+                    r, _, _ = select.select([_mac_server_sock], [], [], 0)
+                    if r:
+                        conn, _ = _mac_server_sock.accept()
+                        try:
+                            if conn.recv(16) == b"show":
+                                self.show_all()
+                        finally:
+                            conn.close()
+                except OSError:
+                    pass
         self.root.after(500, self._poll_show_event)
 
     def _open(self, data: dict = None):
@@ -286,8 +372,37 @@ class App:
 
     # ── 托盘图标 ──────────────────────────────────────────────────
     def _setup_tray(self):
-        t = threading.Thread(target=self._tray_loop, daemon=True)
-        t.start()
+        if _IS_WIN:
+            t = threading.Thread(target=self._tray_loop, daemon=True)
+            t.start()
+        else:
+            self._setup_pystray()
+
+    def _setup_pystray(self):
+        """macOS / Linux 托盘（pystray + Pillow）。"""
+        try:
+            import pystray
+            from PIL import Image as _PILImage
+            icon_path = os.path.join(_BASE, "sheep.ico")
+            try:
+                img = _PILImage.open(icon_path).convert("RGBA")
+            except Exception:
+                img = _PILImage.new("RGBA", (64, 64), (87, 111, 176, 255))
+            self._pystray_icon = pystray.Icon(
+                "SheepNote", img, menu=self._build_pystray_menu())
+            self._pystray_icon.run_detached()
+        except Exception:
+            pass   # pystray / Pillow 未安装，静默跳过
+
+    def _build_pystray_menu(self):
+        import pystray
+        return pystray.Menu(
+            pystray.MenuItem(T("tray_show"),
+                             lambda *_: self.root.after(0, self.show_all)),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(T("tray_exit"),
+                             lambda *_: self.root.after(0, self._quit)),
+        )
 
     def _tray_loop(self):
         WM_APP       = 0x8000
@@ -422,13 +537,20 @@ class App:
             self._quit()
 
     def _quit(self):
-        try:
-            self._tray_ready.wait(timeout=2.0)   # D: 确保 hwnd 已就绪
-            hwnd = self._tray_hwnd
-            if hwnd:
-                ctypes.windll.user32.PostMessageW(hwnd, 0x0012, 0, 0)
-        except Exception:
-            pass
+        if _IS_WIN:
+            try:
+                self._tray_ready.wait(timeout=2.0)
+                hwnd = self._tray_hwnd
+                if hwnd:
+                    ctypes.windll.user32.PostMessageW(hwnd, 0x0012, 0, 0)
+            except Exception:
+                pass
+        else:
+            if self._pystray_icon:
+                try:
+                    self._pystray_icon.stop()
+                except Exception:
+                    pass
         self.save()
         self.root.quit()
 
@@ -447,6 +569,12 @@ class App:
         _LANG[0]  = new_lang
         self.save()
         self._close_list_popups()
+        # 非 Win32：重建 pystray 菜单让语言即时生效
+        if not _IS_WIN and self._pystray_icon:
+            try:
+                self._pystray_icon.menu = self._build_pystray_menu()
+            except Exception:
+                pass
         for note in self.notes:
             try:
                 note.pin_btn.config(text=T("pin"))
@@ -802,28 +930,25 @@ class StickyNote:
             self._undo_clear_done()
 
     # ════════════════════════════════════════════════════════════════
-    # P2: 圆角 + DWM 投影
+    # P2: 圆角 + DWM 投影（Windows only；macOS 原生自带）
     # ════════════════════════════════════════════════════════════════
     def _get_hwnd(self) -> int:
-        # winfo_id() 返回内层 content frame 的 HWND；GetParent 才是真正的 OS 窗口
+        if not _IS_WIN:
+            return 0
         inner = self.win.winfo_id()
         outer = ctypes.windll.user32.GetParent(inner)
-        # J: 校验 outer 有效性，无效时降级到 inner
         if outer and ctypes.windll.user32.IsWindow(outer):
             return outer
         return inner
 
     def _apply_rounded(self, radius: int = 10):
+        if not _IS_WIN:
+            return   # macOS 窗口自带圆角，无需处理
         try:
             hwnd = self._get_hwnd()
-            # 优先使用 Windows 11 原生 DWM 圆角（一次性，resize 后无需重设）
-            DWMWA_WINDOW_CORNER_PREFERENCE = 33
-            DWMWCP_ROUNDSMALL = 3
             res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-                ctypes.byref(ctypes.c_int(DWMWCP_ROUNDSMALL)), 4)
+                hwnd, 33, ctypes.byref(ctypes.c_int(3)), 4)
             if res != 0:
-                # Windows 10 回退：SetWindowRgn 裁剪窗口形状
                 self.win.update_idletasks()
                 w = self.win.winfo_width()
                 h = self.win.winfo_height()
@@ -836,13 +961,13 @@ class StickyNote:
             pass
 
     def _apply_shadow(self):
+        if not _IS_WIN:
+            return   # macOS 窗口自带投影
         try:
             hwnd = self._get_hwnd()
-            DWMWA_NCRENDERING_POLICY = 2
-            policy = ctypes.c_int(2)   # DWMNCRP_ENABLED
+            policy = ctypes.c_int(2)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, DWMWA_NCRENDERING_POLICY,
-                ctypes.byref(policy), ctypes.sizeof(policy))
+                hwnd, 2, ctypes.byref(policy), ctypes.sizeof(policy))
         except Exception:
             pass
 
@@ -1108,23 +1233,29 @@ class StickyNote:
     # 弹出面板通用系统
     # ════════════════════════════════════════════════════════════════
     def _monitor_workarea(self) -> tuple:
-        try:
-            class RECT(ctypes.Structure):
-                _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                            ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-            class MONITORINFO(ctypes.Structure):
-                _fields_ = [("cbSize", ctypes.c_ulong),
-                            ("rcMonitor", RECT), ("rcWork", RECT),
-                            ("dwFlags", ctypes.c_ulong)]
-            hwnd = self.win.winfo_id()
-            hm   = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)
-            mi   = MONITORINFO()
-            mi.cbSize = ctypes.sizeof(MONITORINFO)
-            ctypes.windll.user32.GetMonitorInfoW(hm, ctypes.byref(mi))
-            r = mi.rcWork
-            return r.left, r.top, r.right, r.bottom
-        except Exception:
-            return (0, 0, self.win.winfo_screenwidth(), self.win.winfo_screenheight())
+        if _IS_WIN:
+            try:
+                class RECT(ctypes.Structure):
+                    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+                class MONITORINFO(ctypes.Structure):
+                    _fields_ = [("cbSize", ctypes.c_ulong),
+                                ("rcMonitor", RECT), ("rcWork", RECT),
+                                ("dwFlags", ctypes.c_ulong)]
+                hwnd = self.win.winfo_id()
+                hm   = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)
+                mi   = MONITORINFO()
+                mi.cbSize = ctypes.sizeof(MONITORINFO)
+                ctypes.windll.user32.GetMonitorInfoW(hm, ctypes.byref(mi))
+                r = mi.rcWork
+                return r.left, r.top, r.right, r.bottom
+            except Exception:
+                pass
+        # macOS / fallback: use tkinter screen dimensions; leave 25px for macOS menubar
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        top_offset = 25 if _IS_MAC else 0
+        return (0, top_offset, sw, sh)
 
     def _open_popup(self, anchor: tk.Widget, attr: str, build_fn) -> None:
         existing = getattr(self, attr, None)
@@ -1153,34 +1284,42 @@ class StickyNote:
         card.pack(padx=1, pady=1, fill=tk.BOTH, expand=True)
         build_fn(card)
 
-        u32 = ctypes.windll.user32
-        vx = u32.GetSystemMetrics(76)
-        vy = u32.GetSystemMetrics(77)
-        vw = u32.GetSystemMetrics(78)
-        vh = u32.GetSystemMetrics(79)
-        overlay = tk.Toplevel(self.win)
-        overlay.overrideredirect(True)
-        overlay.configure(bg="black")
-        overlay.attributes("-alpha", 0.01)
-        overlay.attributes("-topmost", False)
-        overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")
-        overlay.lower(popup)
+        if _IS_WIN:
+            u32 = ctypes.windll.user32
+            vx = u32.GetSystemMetrics(76)
+            vy = u32.GetSystemMetrics(77)
+            vw = u32.GetSystemMetrics(78)
+            vh = u32.GetSystemMetrics(79)
+            overlay = tk.Toplevel(self.win)
+            overlay.overrideredirect(True)
+            overlay.configure(bg="black")
+            overlay.attributes("-alpha", 0.01)
+            overlay.attributes("-topmost", False)
+            overlay.geometry(f"{vw}x{vh}+{vx}+{vy}")
+            overlay.lower(popup)
 
-        def _close():
-            try:
-                if overlay.winfo_exists(): overlay.destroy()
-            except Exception: pass
-            try:
-                if popup.winfo_exists(): popup.destroy()
-            except Exception: pass
+            def _close():
+                try:
+                    if overlay.winfo_exists(): overlay.destroy()
+                except Exception: pass
+                try:
+                    if popup.winfo_exists(): popup.destroy()
+                except Exception: pass
 
-        overlay.bind("<Button-1>", lambda e: _close())
-        popup.bind("<Destroy>",
-                   lambda e: overlay.destroy() if overlay.winfo_exists() else None,
-                   add="+")
+            overlay.bind("<Button-1>", lambda *_: _close())
+            popup.bind("<Destroy>",
+                       lambda *_: overlay.destroy() if overlay.winfo_exists() else None,
+                       add="+")
+        else:
+            def _close():
+                try:
+                    if popup.winfo_exists(): popup.destroy()
+                except Exception: pass
+
         # P1: Escape 关闭弹窗
-        popup.bind("<Escape>",  lambda e: _close())
-        overlay.bind("<Escape>", lambda e: _close())
+        popup.bind("<Escape>",  lambda *_: _close())
+        if _IS_WIN:
+            overlay.bind("<Escape>", lambda *_: _close())
 
         popup.update_idletasks()
         pw = popup.winfo_reqwidth()
@@ -1193,12 +1332,13 @@ class StickyNote:
         popup.geometry(f"{pw}x{ph}+{bx}+{by}")
         popup.deiconify()       # 定位完成后再显示
         popup.lift()
-        try:
-            hwnd = popup.winfo_id()
-            ctypes.windll.dwmapi.DwmSetWindowAttribute(
-                hwnd, 33, ctypes.byref(ctypes.c_int(3)), 4)
-        except Exception:
-            pass
+        if _IS_WIN:
+            try:
+                hwnd = popup.winfo_id()
+                ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, 33, ctypes.byref(ctypes.c_int(3)), 4)
+            except Exception:
+                pass
 
     # ── 便签列表 + 设置 综合弹出 ──────────────────────────────────
     @staticmethod
@@ -1840,6 +1980,10 @@ class StickyNote:
 
 # ════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    if not _single_instance():
-        sys.exit(0)
+    if _IS_WIN:
+        if not _single_instance():
+            sys.exit(0)
+    else:
+        if not _single_instance_mac():
+            sys.exit(0)
     App().run()
