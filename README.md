@@ -139,13 +139,21 @@ D:\任意目录\
 
 ## 从源码构建
 
+**Windows：**
 ```bash
 pip install pyinstaller
 python -m PyInstaller --onefile --noconsole --icon=sheep.ico \
-    --version-file=version_info.txt --name=SheepNote sticky_note.py
+    --version-file=version_info.txt --name=SheepNote-v4.2.0-Windows sticky_note.py
 ```
+构建产物：`dist/SheepNote-v4.2.0-Windows.exe`
 
-构建产物位于 `dist/SheepNote.exe`。
+**macOS：**
+```bash
+pip install pyinstaller pystray pillow
+python -m PyInstaller --onefile --windowed --icon=sheep.ico \
+    --name=SheepNote-v4.2.0-macOS sticky_note.py
+```
+构建产物：`dist/SheepNote-v4.2.0-macOS.app`
 
 ---
 
