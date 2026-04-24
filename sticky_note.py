@@ -1152,6 +1152,13 @@ class StickyNote:
             self._animate_tb(True)
 
         def on_leave(e):
+            p = getattr(self, "_list_popup", None)
+            if p:
+                try:
+                    if p.winfo_exists():
+                        return
+                except Exception:
+                    pass
             try:
                 wx = self.win.winfo_rootx()
                 wy = self.win.winfo_rooty()
@@ -1615,8 +1622,17 @@ class StickyNote:
         ctx = tk.Menu(parent, tearoff=0)
         ctx.add_command(label=T("menu_del_note"),
                         command=lambda n=note: n._confirm_delete_note())
+
+        def _list_ctx(e):
+            ctx.tk_popup(e.x_root, e.y_root)
+            cur = "#FFFFFF" if _vis[0] else ROW_HID_BG
+            try:
+                for w in all_w: w.config(bg=cur)
+                for ch in inner.winfo_children(): ch.config(bg=cur)
+            except Exception:
+                pass
         for w in (body, inner):
-            w.bind("<Button-3>", lambda e: ctx.tk_popup(e.x_root, e.y_root))
+            w.bind("<Button-3>", _list_ctx)
 
     # ════════════════════════════════════════════════════════════════
     # 任务列表渲染
@@ -1749,6 +1765,10 @@ class StickyNote:
             m = tk.Menu(self.win, tearoff=0)
             m.add_command(label=T("menu_del_task"), command=lambda: self._delete(i))
             m.tk_popup(e.x_root, e.y_root)
+            try:
+                for w in _hvw: w.config(bg=bg)
+            except Exception:
+                pass
         for w in (outer, inner, cb):
             w.bind("<Button-3>", _row_ctx)
         if done or not interactive:
