@@ -6,6 +6,28 @@
 
 ---
 
+## 更新日志
+
+### v4.4（2026-04-25）
+
+- **修复**：删除单条任务后 Undo Toast 有时立即消失的问题（空文本条目的延迟删除事件与显式删除事件相互覆盖）
+- **修复**：锁定模式下无法触发侧边收缩（锁定仅应阻止拖拽，不应阻止边缘隐藏）
+- **修复**：锁定状态下锁图标悬停时变为开锁图标（现改为仅高亮背景，图标始终保持 🔒）
+- **改进**：侧边隐藏动画改为 Apple 样式——窗口以 cubic ease-out 平滑滑出屏幕，保留 16 px 可见条；悬停时平滑滑回，不再使用覆盖层药丸
+
+### v4.3
+
+- 新增边缘收缩（Edge Snap）功能：窗口拖至屏幕边缘自动折叠为药丸，悬停展开
+- 锁定模式下 hover 显示左下角锁图标
+- 工具栏常驻显示
+
+### v4.2
+
+- 跨平台支持（Windows / macOS）
+- 版本号与平台标识写入打包产物文件名
+
+---
+
 ## 功能一览
 
 | 功能 | 说明 |
@@ -139,13 +161,21 @@ D:\任意目录\
 
 ## 从源码构建
 
+**Windows：**
 ```bash
 pip install pyinstaller
 python -m PyInstaller --onefile --noconsole --icon=sheep.ico \
-    --version-file=version_info.txt --name=SheepNote sticky_note.py
+    --version-file=version_info.txt --name=SheepNote-v4.2.0-Windows sticky_note.py
 ```
+构建产物：`dist/SheepNote-v4.2.0-Windows.exe`
 
-构建产物位于 `dist/SheepNote.exe`。
+**macOS：**
+```bash
+pip install pyinstaller pystray pillow
+python -m PyInstaller --onefile --windowed --icon=sheep.ico \
+    --name=SheepNote-v4.2.0-macOS sticky_note.py
+```
+构建产物：`dist/SheepNote-v4.2.0-macOS.app`
 
 ---
 

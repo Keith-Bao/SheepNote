@@ -20,7 +20,7 @@ VSVersionInfo(
            StringStruct(u'FileVersion', u'4.2.0.0'),
            StringStruct(u'InternalName', u'SheepNote'),
            StringStruct(u'LegalCopyright', u'© 大绵羊'),
-           StringStruct(u'OriginalFilename', u'SheepNote.exe'),
+           StringStruct(u'OriginalFilename', u'SheepNote-v4.2.0-Windows.exe'),
            StringStruct(u'ProductName', u'SheepNote'),
            StringStruct(u'ProductVersion', u'4.2.0.0')])
       ]

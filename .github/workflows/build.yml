@@ -20,16 +20,29 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller
 
-      - name: Build EXE
+      - name: Get version
+        id: version
+        shell: bash
         run: |
-          python -m PyInstaller --onefile --noconsole --icon=sheep.ico `
-            --version-file=version_info.txt --name=SheepNote sticky_note.py
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=dev" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build EXE
+        shell: bash
+        run: |
+          python -m PyInstaller --onefile --noconsole --icon=sheep.ico \
+            --version-file=version_info.txt \
+            --name="SheepNote-${{ steps.version.outputs.VERSION }}-Windows" \
+            sticky_note.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: SheepNote-Windows
-          path: dist/SheepNote.exe
+          path: dist/SheepNote-${{ steps.version.outputs.VERSION }}-Windows.exe
 
   build-macos:
     runs-on: macos-latest
@@ -44,21 +57,32 @@ jobs:
       - name: Install dependencies
         run: pip install pyinstaller pystray pillow
 
+      - name: Get version
+        id: version
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          else
+            echo "VERSION=dev" >> $GITHUB_OUTPUT
+          fi
+
       - name: Build app bundle
         run: |
           python -m PyInstaller --onefile --windowed --icon=sheep.ico \
-            --name=SheepNote sticky_note.py
+            --name="SheepNote-${{ steps.version.outputs.VERSION }}-macOS" \
+            sticky_note.py
 
       - name: Zip app bundle
         run: |
           cd dist
-          zip -r SheepNote-macOS.zip SheepNote.app
+          zip -r "SheepNote-${{ steps.version.outputs.VERSION }}-macOS.zip" \
+            "SheepNote-${{ steps.version.outputs.VERSION }}-macOS.app"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: SheepNote-macOS
-          path: dist/SheepNote-macOS.zip
+          path: dist/SheepNote-${{ steps.version.outputs.VERSION }}-macOS.zip
 
   release:
     needs: [build-windows, build-macos]
@@ -81,5 +105,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            SheepNote.exe
-            SheepNote-macOS.zip
+            SheepNote-*-Windows.exe
+            SheepNote-*-macOS.zip

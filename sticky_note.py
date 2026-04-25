@@ -1,5 +1,5 @@
 """
-SheepNote — 桌面便签小组件 v4.1
+SheepNote — 桌面便签小组件 v4.4
 Apple HIG 全面优化：
   P0 数据安全  : 删除便签/清除已完成加确认；任务删除支持 3s Undo Toast
   P1 核心体验  : Escape 关闭弹窗 / Ctrl+N 新建 / 统一 Token / FG_HINT 对比度修复
@@ -8,8 +8,11 @@ Apple HIG 全面优化：
   v4.1 修复   : 滚轮泄漏 / Mutex 释放 / Toast 状态机 / 托盘线程同步 /
                _refresh 防抖 / 确认框崩溃 / pending-delete 并发 /
                列表弹窗状态 / HWND 校验 / 删除时资源清理
+  v4.2 新增   : 锁定按钮移至左下角(hover显示) / 工具栏常驻 / 任务可换行
+               托盘图标内嵌 / 任务栏隐藏 / 边缘自动收缩
   跨平台      : Windows (Win32 原生) / macOS (pystray + socket IPC)
 """
+_VERSION = "4.4"
 import colorsys
 import tkinter as tk
 from tkinter import ttk
@@ -258,6 +261,13 @@ TB_HIDE_DELAY  = 600   # 工具栏隐藏延迟 ms
 SB_HIDE_DELAY  = 2500  # 滚动条隐藏延迟 ms
 TOAST_DURATION = 3000  # Undo Toast 显示时长 ms
 
+EDGE_THRESHOLD  = 8    # px：距屏幕边缘多近触发收缩
+EDGE_PILL_THICK = 20   # 药丸厚度（左/右时是宽，上/下时是高）
+EDGE_PILL_SPAN  = 72   # 药丸长度（左/右时是高，上/下时是宽）
+EDGE_STRIP_WIDTH = 16  # Apple 样式可见条宽度（px）
+EDGE_ANIM_STEPS  = 10  # 滑动动画帧数
+EDGE_ANIM_MS     = 16  # 每帧间隔（ms，共 ~160ms）
+
 # ── 便签预设颜色 + 对应工具栏色 ──────────────────────────────────
 NOTE_COLORS = [
     ("#FFF9C4", "暖黄"),
@@ -489,8 +499,10 @@ class App:
         icon_path = os.path.join(_BASE, "sheep.ico")
         if os.path.exists(icon_path):
             hicon = user32.LoadImageW(None, icon_path, 1, 0, 0, 0x10)
+            if not hicon:
+                hicon = self._create_fallback_icon()
         else:
-            hicon = user32.LoadIconW(None, 32512)
+            hicon = self._create_fallback_icon()
 
         nid = NOTIFYICONDATA()
         nid.cbSize           = ctypes.sizeof(NOTIFYICONDATA)
@@ -536,6 +548,35 @@ class App:
         elif cmd == 1002:
             self._quit()
 
+    @staticmethod
+    def _create_fallback_icon() -> int:
+        """用 Win32 API 生成 32×32 蓝色方块图标（无需 ico 文件）。"""
+        try:
+            SIZE = 32
+            r, g, b = 87, 111, 176   # ACCENT 蓝
+            pixels   = bytes([b, g, r, 0] * SIZE * SIZE)  # BGRA × 像素数
+            hbm_color = ctypes.windll.gdi32.CreateBitmap(
+                SIZE, SIZE, 1, 32, ctypes.c_char_p(pixels))
+            hbm_mask  = ctypes.windll.gdi32.CreateBitmap(SIZE, SIZE, 1, 1, None)
+
+            class ICONINFO(ctypes.Structure):
+                _fields_ = [("fIcon",    wintypes.BOOL),
+                            ("xHotspot", wintypes.DWORD),
+                            ("yHotspot", wintypes.DWORD),
+                            ("hbmMask",  wintypes.HANDLE),
+                            ("hbmColor", wintypes.HANDLE)]
+
+            ii = ICONINFO()
+            ii.fIcon    = True
+            ii.hbmMask  = hbm_mask
+            ii.hbmColor = hbm_color
+            hicon = ctypes.windll.user32.CreateIconIndirect(ctypes.byref(ii))
+            ctypes.windll.gdi32.DeleteObject(hbm_color)
+            ctypes.windll.gdi32.DeleteObject(hbm_mask)
+            return hicon or ctypes.windll.user32.LoadIconW(None, 32512)
+        except Exception:
+            return ctypes.windll.user32.LoadIconW(None, 32512)
+
     def _quit(self):
         if _IS_WIN:
             try:
@@ -555,7 +596,8 @@ class App:
         self.root.quit()
 
     def save(self):
-        data = {"lang": self.lang, "notes": [n.snapshot() for n in self.notes]}
+        data = {"version": _VERSION, "lang": self.lang,
+                "notes": [n.snapshot() for n in self.notes]}
         try:
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -672,6 +714,8 @@ class StickyNote:
         self.win  = tk.Toplevel(master)
         self.win.title("SheepNote")
         self.win.overrideredirect(True)
+        if _IS_WIN:
+            self.win.after(120, self._hide_from_taskbar)
 
         self._dx = self._dy = 0
         self._rsx = self._rsy = self._rsw = self._rsh = 0
@@ -692,6 +736,16 @@ class StickyNote:
         self._alpha:   float = data.get("alpha",     AL_DEF)
         self._bg:      str   = data.get("color",     BG_NOTE)
         self._locked:  bool  = False
+        self._edge_snap:      bool       = data.get("edge_snap", False)
+        self._edge_collapsed: bool       = False
+        self._pre_edge_geo:   tuple|None = None
+        self._edge_side:      str|None   = None
+        self._edge_poll_id:   str|None   = None
+        self._edge_peeking:   bool       = False
+        self._edge_delay_cnt: int        = 0
+        self._edge_cooldown:  bool       = False   # 收缩后冷却期，防止立即 peek
+        self._edge_leave_id:  str|None   = None    # peek 离开后的延迟收缩 timer
+        self._edge_anim_id:   str|None   = None    # 当前滑动动画 after ID
         self._saved_geo = data
         self._offset    = offset
 
@@ -750,6 +804,7 @@ class StickyNote:
         self._bg = color
         self._compute_derived_colors()
         self._apply_tb_color()   # 已在此处正确处理 _lock_strip（locked → ACCENT）
+        self._pill_frame.configure(bg=self._tbg)
         for w in (self.win, self._list_outer, self.canvas,
                   self.sf, self._rsz_canvas, self._sb_canvas):
             try:
@@ -985,6 +1040,19 @@ class StickyNote:
         self._lock_strip = tk.Frame(self.win, width=3, bg=self._bg)
         self._lock_strip.place(relx=0, rely=0, relheight=1.0, anchor="nw")
 
+        # 锁定状态左下角锁定按钮（hover 时出现，低存在感灰色）
+        self._lock_icon_btn = tk.Label(
+            self.win, text="🔒", bg="#888888", fg="#EEEEEE",
+            font=("Segoe UI Emoji", 11), cursor="hand2", padx=4, pady=2)
+        self._lock_icon_btn.place_forget()
+        self._lock_icon_btn.bind("<Button-1>", lambda e: self._toggle_lock())
+        self._lock_icon_btn.bind("<Enter>",    lambda e: self._lock_icon_btn.config(bg="#AAAAAA"))
+        self._lock_icon_btn.bind("<Leave>",    lambda e: self._lock_icon_btn.config(bg="#888888"))
+
+        # 边缘收缩药丸覆盖层（收缩时盖住内容，显示主题色药丸）
+        self._pill_frame = tk.Frame(self.win, bg=self._tbg)
+        # 初始不放置，收缩时再 place
+
         # ── 工具栏 ─────────────────────────────────────────────────
         self.tb = tk.Frame(self.win, bg=self._tbg, height=0)
         self.tb.pack(fill=tk.X)
@@ -1042,6 +1110,7 @@ class StickyNote:
         self.canvas.configure(yscrollcommand=self._on_yscroll)
         self.canvas.bind("<Configure>",
                          lambda e: self.canvas.itemconfig(self._cwin, width=e.width))
+        self.canvas.bind("<Configure>", lambda e: self._refresh(), add="+")
 
         def _on_wheel(e):
             cx, cy = self.canvas.winfo_rootx(), self.canvas.winfo_rooty()
@@ -1067,9 +1136,9 @@ class StickyNote:
         self._ctx.add_separator()
         self._ctx.add_command(label=T("menu_del_note"), command=self._confirm_delete_note)
         self.canvas.bind("<Button-3>",
-                         lambda e: self._ctx.tk_popup(e.x_root, e.y_root))
+                         lambda e: (None if self._locked else self._ctx.tk_popup(e.x_root, e.y_root)))
         self.sf.bind("<Button-3>",
-                     lambda e: self._ctx.tk_popup(e.x_root, e.y_root))
+                     lambda e: (None if self._locked else self._ctx.tk_popup(e.x_root, e.y_root)))
 
         self.canvas.pack(fill=tk.BOTH, expand=True)
 
@@ -1095,6 +1164,10 @@ class StickyNote:
                       add="+")
 
         self._bind_hover()
+        # 工具栏常驻，不依赖 hover
+        self._tb_h = TB_HEIGHT
+        self.tb.config(height=TB_HEIGHT)
+        self._set_tb_content_visible(True)
 
     # ── 工具栏按钮工厂 ────────────────────────────────────────────
     def _tbtn(self, text, cmd, hover=None, parent=None, font=None) -> _TbBtn:
@@ -1146,20 +1219,15 @@ class StickyNote:
 
     # ── 工具栏 hover 显示 / 隐藏 ─────────────────────────────────
     def _bind_hover(self):
+        """工具栏常驻，仅处理锁定时锁定按钮的 hover 显隐。"""
         def on_enter(e):
-            if self._tb_hide_id:
-                self.win.after_cancel(self._tb_hide_id)
-                self._tb_hide_id = None
-            self._animate_tb(True)
+            if self._locked:
+                self._lock_icon_btn.place(relx=0, rely=1.0, anchor="sw", x=6, y=-6)
+                self._lock_icon_btn.lift()
 
         def on_leave(e):
-            p = getattr(self, "_list_popup", None)
-            if p:
-                try:
-                    if p.winfo_exists():
-                        return
-                except Exception:
-                    pass
+            if not self._locked:
+                return
             try:
                 wx = self.win.winfo_rootx()
                 wy = self.win.winfo_rooty()
@@ -1169,9 +1237,7 @@ class StickyNote:
                     return
             except Exception:
                 return
-            if self._tb_hide_id:
-                self.win.after_cancel(self._tb_hide_id)
-            self._tb_hide_id = self.win.after(TB_HIDE_DELAY, lambda: self._animate_tb(False))
+            self._lock_icon_btn.place_forget()
 
         targets = [self.win, self._list_outer, self.canvas,
                    self.sf, self.tb, self._rsz_canvas]
@@ -1544,6 +1610,18 @@ class StickyNote:
                     _lb.bind("<Enter>",    lambda e, b=_lb: b.config(bg=TAG_HOV))
                     _lb.bind("<Leave>",    lambda e, b=_lb: b.config(bg=TAG_BG))
 
+            # ── 边缘收缩开关 ──────────────────────────────────────────
+            tk.Frame(card, bg="#F0F0F0", height=1).pack(fill=tk.X, pady=(SP1, SP2))
+            snap_row = tk.Frame(card, bg=BG)
+            snap_row.pack(fill=tk.X, pady=(0, SP1))
+            tk.Label(snap_row, text="边缘自动收缩", bg=BG, fg=FG_TASK,
+                     font=FONT_SMALL).pack(side=tk.LEFT)
+            snap_var = tk.BooleanVar(value=self._edge_snap)
+            snap_chk = tk.Checkbutton(snap_row, variable=snap_var, bg=BG,
+                                      activebackground=BG,
+                                      command=lambda: self._set_edge_snap(snap_var.get()))
+            snap_chk.pack(side=tk.RIGHT)
+
         self._open_popup(self.list_btn, "_list_popup", build)
 
     def _list_row(self, parent, idx: int, note: "StickyNote"):
@@ -1724,9 +1802,9 @@ class StickyNote:
             self.win.after(30, self._new_entry.focus_set)
 
     def _make_row(self, idx: int, task: dict):
-        done        = task["done"]
-        interactive = not self._locked
-        bg, bghv    = self._bg, self._bghv
+        done     = task["done"]
+        can_edit = not self._locked   # 编辑/删除/hover高亮仅非锁定时可用
+        bg, bghv = self._bg, self._bghv
 
         outer = tk.Frame(self.sf, bg=bg); outer.pack(fill=tk.X)
         inner = tk.Frame(outer, bg=bg, pady=SP1); inner.pack(fill=tk.X, padx=SP2)
@@ -1745,23 +1823,25 @@ class StickyNote:
         cb_text = "☑" if done else "☐"
         cb_fg   = COLOR_SUCCESS if done else "#AAAAAA"
         cb = tk.Label(inner, text=cb_text, fg=cb_fg, bg=bg, font=FONT_CB,
-                      cursor="hand2" if interactive else "arrow")
+                      cursor="hand2")   # 始终可点击
         cb.pack(side=tk.LEFT, padx=(0, SP1+1))
         _hvw.append(cb)
-        if interactive:
-            cb.bind("<ButtonRelease-1>", lambda e, i=idx: self._toggle(i))
-        cb.bind("<Enter>", hl_on); cb.bind("<Leave>", hl_off)
+        cb.bind("<ButtonRelease-1>", lambda e, i=idx: self._toggle(i))   # 锁定也可 check
+        if can_edit:
+            cb.bind("<Enter>", hl_on); cb.bind("<Leave>", hl_off)
 
-        if done or not interactive:
+        use_label = done or not can_edit
+        if use_label:
             font = self._f_done() if done else self._f()
             fg   = FG_DONE if done else FG_TASK
-            lbl  = tk.Label(inner, text=task["text"], bg=bg, fg=fg,
+            display_text = self._wrap_text(task["text"])
+            lbl  = tk.Label(inner, text=display_text, bg=bg, fg=fg,
                             font=font, anchor="w", justify=tk.LEFT)
             lbl.pack(side=tk.LEFT, fill=tk.X, expand=True)
             _hvw.append(lbl)
-            if interactive:
+            if can_edit:
                 lbl.bind("<ButtonRelease-1>", lambda e, i=idx: self._toggle(i))
-            lbl.bind("<Enter>", hl_on); lbl.bind("<Leave>", hl_off)
+                lbl.bind("<Enter>", hl_on); lbl.bind("<Leave>", hl_off)
         else:
             ent = tk.Entry(inner, font=self._f(), bg=bg, relief="flat",
                            fg=FG_TASK, highlightthickness=0, bd=0,
@@ -1774,7 +1854,7 @@ class StickyNote:
             ent.bind("<KeyRelease>", lambda e, i=idx: self._live_save(i, e.widget))
             ent.bind("<Enter>", hl_on); ent.bind("<Leave>", hl_off)
 
-        if interactive:
+        if can_edit:
             d = tk.Label(inner, text="×", bg=bg, fg="#DDDDDD",
                          font=("Microsoft YaHei", 11), cursor="hand2")
             d.pack(side=tk.RIGHT)
@@ -1783,9 +1863,11 @@ class StickyNote:
             d.bind("<Enter>", lambda e, b=d: (hl_on(e), b.config(fg=COLOR_DANGER)))
             d.bind("<Leave>", lambda e, b=d: (hl_off(e), b.config(fg="#DDDDDD")))
 
-        inner.bind("<Enter>", hl_on); inner.bind("<Leave>", hl_off)
+        if can_edit:
+            inner.bind("<Enter>", hl_on); inner.bind("<Leave>", hl_off)
 
         def _row_ctx(e, i=idx):
+            if self._locked: return
             m = tk.Menu(self.win, tearoff=0)
             m.add_command(label=T("menu_del_task"), command=lambda: self._delete(i))
             m.tk_popup(e.x_root, e.y_root)
@@ -1795,7 +1877,7 @@ class StickyNote:
                 pass
         for w in (outer, inner, cb):
             w.bind("<Button-3>", _row_ctx)
-        if done or not interactive:
+        if use_label:
             lbl.bind("<Button-3>", _row_ctx)
         else:
             ent.bind("<Button-3>", _row_ctx)
@@ -1805,9 +1887,6 @@ class StickyNote:
         outer = tk.Frame(self.sf, bg=bg); outer.pack(fill=tk.X)
         inner = tk.Frame(outer, bg=bg, pady=SP1); inner.pack(fill=tk.X, padx=SP2)
         self._new_outer = outer
-        # 工具栏隐藏时默认不可见，hover 后随工具栏一起显示
-        if self._tb_h == 0:
-            outer.pack_forget()
 
         self._new_cb = tk.Label(inner, text="☐", bg=bg, fg=FG_HINT, font=FONT_CB)
         self._new_cb.pack(side=tk.LEFT, padx=(0, SP1+1))
@@ -1821,6 +1900,44 @@ class StickyNote:
         ent.bind("<FocusOut>", lambda e: self._new_out(ent))
         ent.bind("<Return>",   lambda e: self._add(ent))
         return ent
+
+    def _wrap_text(self, text: str, max_lines: int = 5) -> str:
+        """按当前 canvas 宽度换行，超过 max_lines 行截断加 '……'"""
+        font    = tkFont.Font(family="Microsoft YaHei", size=self._fs)
+        raw_w   = self.canvas.winfo_width()
+        if raw_w <= 1:                         # 首次渲染前 winfo_width 返回 1
+            raw_w = self._saved_geo.get("w", 290)
+        avail_w = max(80, raw_w - SP2 * 4 - 40)
+        ellipsis = "……"
+        lines, current = [], ""
+        for char in text:
+            test = current + char
+            if font.measure(test) > avail_w:
+                lines.append(current)
+                if len(lines) >= max_lines:
+                    last = lines[-1]
+                    while last and font.measure(last + ellipsis) > avail_w:
+                        last = last[:-1]
+                    lines[-1] = last + ellipsis
+                    return "\n".join(lines)
+                current = char
+            else:
+                current = test
+        if current:
+            lines.append(current)
+        return "\n".join(lines) if lines else text
+
+    def _hide_from_taskbar(self):
+        if not _IS_WIN: return
+        try:
+            GWL_EXSTYLE      = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            hwnd  = self._get_hwnd()
+            style = ctypes.windll.user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE,
+                                                style | WS_EX_TOOLWINDOW)
+        except Exception:
+            pass
 
     def _new_in(self, e: tk.Entry):
         if e.get() == T("placeholder"):
@@ -1902,6 +2019,9 @@ class StickyNote:
 
     def _delete(self, idx: int):
         if idx < len(self.tasks):
+            for aid in list(self._pending_delete_ids.values()):
+                self.win.after_cancel(aid)
+            self._pending_delete_ids.clear()
             task = self.tasks.pop(idx)
             self.app.save()
             # 直接同步重建 DOM，保证 toast 在布局稳定后显示
@@ -1929,15 +2049,16 @@ class StickyNote:
         self._locked = not self._locked
         if self._locked:
             self.lock_btn.config(bg=ACCENT)
-            self.win.attributes("-alpha", max(AL_MIN, round(self._alpha - 0.2, 1)))
             self._rsz_canvas.config(cursor="arrow")
-            # P2: 左侧色条变为 ACCENT 蓝，持久显示锁定状态
             self._lock_strip.config(bg=ACCENT)
+            # 按钮不立即显示，等鼠标 hover 时再浮现
+            self._animate_tb(False)   # 立即收起工具栏
         else:
             self.lock_btn.config(bg=self._tbg)
-            self.win.attributes("-alpha", self._alpha)
             self._rsz_canvas.config(cursor="sizing")
             self._lock_strip.config(bg=self._bg)
+            self._lock_icon_btn.place_forget()
+            self._animate_tb(True)   # 解锁后恢复工具栏
         self._refresh()
 
     # ════════════════════════════════════════════════════════════════
@@ -1986,6 +2107,7 @@ class StickyNote:
         # P2: 圆角 + 投影
         self.win.after(80, self._apply_rounded)
         self.win.after(80, self._apply_shadow)
+        self.win.after(500, self._poll_edge)
 
     def snapshot(self) -> dict:
         return {
@@ -1998,7 +2120,148 @@ class StickyNote:
             "font_size": self._fs,
             "alpha":     self._alpha,
             "color":     self._bg,
+            "edge_snap": self._edge_snap,
         }
+
+    # ════════════════════════════════════════════════════════════════
+    # 屏幕边缘自动收缩
+    # ════════════════════════════════════════════════════════════════
+    def _set_edge_snap(self, on: bool):
+        self._edge_snap = on
+        if not on and self._edge_collapsed:
+            self._restore_from_edge()
+        self.app.save()
+
+    def _poll_edge(self):
+        if not self._edge_snap or self.win.state() == "withdrawn":
+            self._edge_poll_id = self.win.after(300, self._poll_edge)
+            return
+        try:
+            wx, wy = self.win.winfo_x(), self.win.winfo_y()
+            ww, wh = self.win.winfo_width(), self.win.winfo_height()
+            if self._edge_collapsed and not self._edge_peeking and self._pre_edge_geo:
+                ox, oy, ow, oh = self._pre_edge_geo
+                check_x, check_y, check_w, check_h = ox, oy, ow, oh
+            else:
+                check_x, check_y, check_w, check_h = wx, wy, ww, wh
+            ml, mt, mr, mb = self._monitor_workarea()
+            at_left   = check_x <= ml + EDGE_THRESHOLD
+            at_right  = check_x + check_w >= mr - EDGE_THRESHOLD
+            at_top    = check_y <= mt + EDGE_THRESHOLD
+            at_bottom = check_y + check_h >= mb - EDGE_THRESHOLD
+            at_edge   = at_left or at_right or at_top or at_bottom
+
+            if at_edge and not self._edge_collapsed:
+                self._edge_delay_cnt += 1
+                if self._edge_delay_cnt >= 3:
+                    self._edge_side = ("left"   if at_left  else
+                                       "right"  if at_right else
+                                       "top"    if at_top   else "bottom")
+                    self._collapse_to_edge()
+                    self._edge_delay_cnt = 0
+            elif not at_edge:
+                self._edge_delay_cnt = 0
+                if self._edge_collapsed:
+                    self._restore_from_edge()
+            else:
+                self._edge_delay_cnt = 0
+                # peeking 状态下的收缩由 <Leave> timer 驱动，poll 不干预
+        except Exception:
+            pass
+        self._edge_poll_id = self.win.after(300, self._poll_edge)
+
+    def _animate_edge_slide(self, sx, sy, tx, ty, w, h, step):
+        t = step / EDGE_ANIM_STEPS
+        e = 1 - (1 - t) ** 3
+        cx = int(sx + (tx - sx) * e)
+        cy = int(sy + (ty - sy) * e)
+        self.win.geometry(f"{w}x{h}+{cx}+{cy}")
+        if step < EDGE_ANIM_STEPS:
+            self._edge_anim_id = self.win.after(
+                EDGE_ANIM_MS,
+                lambda: self._animate_edge_slide(sx, sy, tx, ty, w, h, step + 1))
+        else:
+            self._edge_anim_id = None
+
+    def _collapse_to_edge(self):
+        if self._edge_leave_id:
+            self.win.after_cancel(self._edge_leave_id)
+            self._edge_leave_id = None
+        if not self._pre_edge_geo:
+            self._pre_edge_geo = (self.win.winfo_x(), self.win.winfo_y(),
+                                  self.win.winfo_width(), self.win.winfo_height())
+        self._edge_collapsed = True
+        self._edge_peeking   = False
+
+        x, y, w, h = self._pre_edge_geo
+        ml, mt, mr, mb = self._monitor_workarea()
+        side = self._edge_side
+
+        # Apple 样式：滑出屏幕，仅保留 EDGE_STRIP_WIDTH px 可见
+        if side == "left":
+            tx, ty = ml - (w - EDGE_STRIP_WIDTH), y
+        elif side == "right":
+            tx, ty = mr - EDGE_STRIP_WIDTH, y
+        elif side == "top":
+            tx, ty = x, mt - (h - EDGE_STRIP_WIDTH)
+        else:
+            tx, ty = x, mb - EDGE_STRIP_WIDTH
+
+        if self._edge_anim_id:
+            self.win.after_cancel(self._edge_anim_id)
+        cx, cy = self.win.winfo_x(), self.win.winfo_y()
+        self._animate_edge_slide(cx, cy, tx, ty, w, h, 0)
+        self.win.after(30, self._apply_rounded)
+
+        self._edge_cooldown = True
+        self.win.after(600, lambda: setattr(self, "_edge_cooldown", False))
+        self.win.bind("<Enter>", lambda e: self._edge_peek(), add="+")
+
+    def _edge_peek(self):
+        if not self._edge_collapsed or self._edge_peeking: return
+        if self._edge_cooldown: return
+        self._edge_peeking = True
+        if self._pre_edge_geo:
+            ox, oy, ow, oh = self._pre_edge_geo
+            if self._edge_anim_id:
+                self.win.after_cancel(self._edge_anim_id)
+            cx, cy = self.win.winfo_x(), self.win.winfo_y()
+            self._animate_edge_slide(cx, cy, ox, oy, ow, oh, 0)
+        self.win.after(30, self._apply_rounded)
+        self.win.bind("<Leave>", self._edge_on_leave, add="+")
+
+    def _edge_on_leave(self, e):
+        if not self._edge_peeking: return
+        try:
+            wx = self.win.winfo_rootx(); wy = self.win.winfo_rooty()
+            ww = self.win.winfo_width(); wh = self.win.winfo_height()
+            if wx <= e.x_root <= wx + ww and wy <= e.y_root <= wy + wh:
+                return
+        except Exception:
+            return
+        if self._edge_leave_id:
+            self.win.after_cancel(self._edge_leave_id)
+        self._edge_leave_id = self.win.after(1000, self._edge_collapse_after_leave)
+
+    def _edge_collapse_after_leave(self):
+        self._edge_leave_id = None
+        if self._edge_peeking:
+            self._edge_peeking = False
+            self._collapse_to_edge()
+
+    def _restore_from_edge(self):
+        if not self._edge_collapsed: return
+        if self._edge_anim_id:
+            self.win.after_cancel(self._edge_anim_id)
+            self._edge_anim_id = None
+        self._edge_collapsed = False
+        self._edge_peeking   = False
+        if self._pre_edge_geo:
+            ox, oy, ow, oh = self._pre_edge_geo
+            self.win.geometry(f"{ow}x{oh}+{ox}+{oy}")
+            self._pre_edge_geo = None
+        self._edge_side = None
+        self.win.after(30, self._apply_rounded)
 
     def _cleanup(self):
         """M: 删除便签前取消所有 after 任务、关闭子弹窗，防止内存泄漏。"""
@@ -2011,7 +2274,8 @@ class StickyNote:
                 except Exception:
                     pass
         for attr in ("_round_after", "_tb_anim_id", "_tb_hide_id",
-                     "_toast_after", "_sb_hide_id", "_refresh_id"):
+                     "_toast_after", "_sb_hide_id", "_refresh_id",
+                     "_edge_poll_id", "_edge_leave_id", "_edge_anim_id"):
             aid = getattr(self, attr, None)
             if aid:
                 try:
