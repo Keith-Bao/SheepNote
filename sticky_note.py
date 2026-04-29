@@ -364,11 +364,19 @@ class App:
 
     def delete_note(self, note: "StickyNote"):
         self._close_list_popups()
-        note._cleanup()                 # M: 取消 after 任务、关闭子弹窗
+        note._cleanup()
+
         if note in self.notes:
             self.notes.remove(note)
+
+        try:
+            if note.win.winfo_exists():
+                note.win.destroy()
+        except tk.TclError:
+            pass
+
         self.save()
-        note.win.destroy()
+
         if not self.notes:
             self.root.destroy()
 
@@ -643,8 +651,26 @@ class App:
         self.root.quit()
 
     def save(self):
-        data = {"version": _VERSION, "lang": self.lang,
-                "notes": [n.snapshot() for n in self.notes]}
+        alive_notes = []
+        snapshots = []
+
+        for n in list(self.notes):
+            try:
+                if n.win.winfo_exists():
+                    snapshots.append(n.snapshot())
+                    alive_notes.append(n)
+            except tk.TclError:
+                # 这个 note 的 Toplevel 已经被销毁了，跳过
+                pass
+
+        self.notes = alive_notes
+
+        data = {
+            "version": _VERSION,
+            "lang": self.lang,
+            "notes": snapshots,
+        }
+
         try:
             with open(DATA_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
@@ -840,7 +866,10 @@ class StickyNote:
         self.app  = app
         self.win  = tk.Toplevel(master)
         self.win.title("SheepNote")
-        self.win.overrideredirect(True)
+        if _IS_MAC:
+            self.win.overrideredirect(False)
+        else:
+            self.win.overrideredirect(True)
         if _IS_WIN:
             self.win.after(120, self._hide_from_taskbar)
 
@@ -2238,19 +2267,30 @@ class StickyNote:
         self.win.after(500, self._poll_edge)
 
     def snapshot(self) -> dict:
+        try:
+            x = self.win.winfo_x()
+            y = self.win.winfo_y()
+            w = self.win.winfo_width()
+            h = self.win.winfo_height()
+        except tk.TclError:
+            d = self._saved_geo or {}
+            x = d.get("x", 100)
+            y = d.get("y", 100)
+            w = d.get("w", 290)
+            h = d.get("h", 430)
+
         return {
             "tasks":     self.tasks,
-            "x":         self.win.winfo_x(),
-            "y":         self.win.winfo_y(),
-            "w":         self.win.winfo_width(),
-            "h":         self.win.winfo_height(),
+            "x":         x,
+            "y":         y,
+            "w":         w,
+            "h":         h,
             "topmost":   self._topmost,
             "font_size": self._fs,
             "alpha":     self._alpha,
             "color":     self._bg,
             "edge_snap": self._edge_snap,
         }
-
     # ════════════════════════════════════════════════════════════════
     # 屏幕边缘自动收缩
     # ════════════════════════════════════════════════════════════════
