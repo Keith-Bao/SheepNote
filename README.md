@@ -8,6 +8,17 @@
 
 ## 更新日志
 
+### v4.5（2026-04-29）
+
+- **新增**：设置面板中"边缘自动收缩"和"开机自动启动"开关改为 Apple iOS 样式滑块——带动画的圆角药丸，关闭时灰色，开启时绿色（`#34C759`）
+- **新增**：开机自动启动选项（Windows），启用后写入注册表 `HKCU\...\Run`，关闭后自动移除，支持 exe 和直接运行脚本两种方式
+- **修复**：托盘图标按 `SM_CXSMICON`（系统小图标尺寸）精确加载 `.ico`，解决高分屏及多尺寸图标文件显示错误的问题
+- **修复**：设置面板关闭时，`_AppleToggle` 的滑动动画 `after` 回调仍可能触发 `TclError`，现通过 `<Destroy>` 绑定提前取消
+- **修复**：`_autostart_enabled` 在注册表查询失败时未关闭注册表句柄（资源泄漏），改用 `try/finally` 保证释放
+- **清理**：移除从未使用的弹窗属性 `_fs_popup`、`_al_popup`、`_color_popup` 及其清理代码
+- **清理**：移除未使用的常量 `EDGE_PILL_THICK`、`EDGE_PILL_SPAN`
+- **清理**：移除从未放置的 `_pill_frame` 控件及其颜色同步代码
+
 ### v4.4（2026-04-25）
 
 - **修复**：删除单条任务后 Undo Toast 有时立即消失的问题（空文本条目的延迟删除事件与显式删除事件相互覆盖）
@@ -17,7 +28,7 @@
 
 ### v4.3
 
-- 新增边缘收缩（Edge Snap）功能：窗口拖至屏幕边缘自动折叠为药丸，悬停展开
+- 新增边缘收缩（Edge Snap）功能：窗口拖至屏幕边缘自动折叠，悬停展开
 - 锁定模式下 hover 显示左下角锁图标
 - 工具栏常驻显示
 
@@ -41,6 +52,8 @@
 | 便签列表 | 一键查看所有便签，控制显示 / 隐藏，直接删除 |
 | 置顶 | 固定便签始终显示在其他窗口前面 |
 | 锁定 | 锁定后内容只读，防止误触修改 |
+| 边缘自动收缩 | 拖至屏幕边缘自动折叠，保留 16px 可见条，悬停展开 |
+| 开机自动启动 | 登录时自动启动（写入注册表，支持 exe 和脚本两种运行方式） |
 | 数据持久化 | 关闭窗口只是隐藏，重新打开原样恢复 |
 | 单实例唤醒 | 再次双击 exe 可唤醒所有隐藏的便签 |
 
@@ -56,9 +69,7 @@
 
 ## 界面说明
 
-### 工具栏（悬停显示）
-
-鼠标移入便签时，顶部工具栏从便签内滑出；鼠标离开后自动收回。
+### 工具栏
 
 ```
 [⠿ SheepNote] [📋] [＋]       [置顶] [🔒] [×]
@@ -72,7 +83,7 @@
 | `＋` | 新建一张便签 |
 | `置顶` | 切换置顶模式 |
 | `🔒` | 切换锁定模式（锁定后内容只读） |
-| `×` | 隐藏所有便签（数据保留，再次双击 exe 可恢复） |
+| `×` | 隐藏当前便签（数据保留，再次双击 exe 可恢复） |
 
 ### 任务区
 
@@ -89,6 +100,10 @@
 ### 滚动条
 
 内容超出便签高度时，右侧会出现细圆角滚动条，静止 2.5 秒后自动隐藏。
+
+### 边缘自动收缩
+
+将便签拖至屏幕任意边缘（8px 以内），停留约 1 秒后自动以 cubic ease-out 动画折叠，保留 16px 可见条。鼠标悬停时展开，移开后 1 秒再次收缩。可在设置面板中开启或关闭此功能。
 
 ---
 
@@ -109,6 +124,11 @@
 - **字号**：拖动滑块实时调节（9–18pt）
 - **透明度**：拖动滑块实时调节（30%–100%）
 - **语言**：点击语言缩写切换界面语言，重启后保留
+
+**全局选项**
+
+- **边缘自动收缩**：Apple iOS 样式开关，开启后拖至屏幕边缘自动折叠
+- **开机自动启动**（仅 Windows）：Apple iOS 样式开关，开启后注册开机启动项
 
 ---
 
@@ -165,25 +185,26 @@ D:\任意目录\
 ```bash
 pip install pyinstaller
 python -m PyInstaller --onefile --noconsole --icon=sheep.ico \
-    --version-file=version_info.txt --name=SheepNote-v4.2.0-Windows sticky_note.py
+    --version-file=version_info.txt --name=SheepNote-v4.5-Windows sticky_note.py
 ```
-构建产物：`dist/SheepNote-v4.2.0-Windows.exe`
+构建产物：`dist/SheepNote-v4.5-Windows.exe`
 
 **macOS：**
 ```bash
 pip install pyinstaller pystray pillow
 python -m PyInstaller --onefile --windowed --icon=sheep.ico \
-    --name=SheepNote-v4.2.0-macOS sticky_note.py
+    --name=SheepNote-v4.5-macOS sticky_note.py
 ```
-构建产物：`dist/SheepNote-v4.2.0-macOS.app`
+构建产物：`dist/SheepNote-v4.5-macOS.app`
 
 ---
 
 ## 技术栈
 
 - **Python 3.12** + **tkinter**（UI）
-- **ctypes / Windows API**：单实例 Mutex、IPC Named Event、多显示器工作区检测、DWM 圆角
+- **ctypes / Windows API**：单实例 Mutex、IPC Named Event、多显示器工作区检测、DWM 圆角、注册表读写
 - **colorsys**：工具栏颜色自动推算
+- **winreg**：开机自动启动注册表操作（Windows only）
 - **PyInstaller**：打包为单文件 exe
 
 ---
@@ -191,4 +212,3 @@ python -m PyInstaller --onefile --windowed --icon=sheep.ico \
 ## 作者
 
 大绵羊 / Keith Bao
-

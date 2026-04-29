@@ -1,5 +1,5 @@
 """
-SheepNote — 桌面便签小组件 v4.4
+SheepNote — 桌面便签小组件 v4.5
 Apple HIG 全面优化：
   P0 数据安全  : 删除便签/清除已完成加确认；任务删除支持 3s Undo Toast
   P1 核心体验  : Escape 关闭弹窗 / Ctrl+N 新建 / 统一 Token / FG_HINT 对比度修复
@@ -10,9 +10,13 @@ Apple HIG 全面优化：
                列表弹窗状态 / HWND 校验 / 删除时资源清理
   v4.2 新增   : 锁定按钮移至左下角(hover显示) / 工具栏常驻 / 任务可换行
                托盘图标内嵌 / 任务栏隐藏 / 边缘自动收缩
+  v4.5 新增   : Apple iOS 样式滑块开关（边缘收缩 / 开机自启）
+               开机自动启动选项（写入注册表 Run 键）
+               修复托盘图标按 SM_CXSMICON 精确加载
+               清理死代码（未使用弹窗属性、常量、pill_frame）
   跨平台      : Windows (Win32 原生) / macOS (pystray + socket IPC)
 """
-_VERSION = "4.4"
+_VERSION = "4.5"
 import colorsys
 import tkinter as tk
 from tkinter import ttk
@@ -262,8 +266,6 @@ SB_HIDE_DELAY  = 2500  # 滚动条隐藏延迟 ms
 TOAST_DURATION = 3000  # Undo Toast 显示时长 ms
 
 EDGE_THRESHOLD  = 8    # px：距屏幕边缘多近触发收缩
-EDGE_PILL_THICK = 20   # 药丸厚度（左/右时是宽，上/下时是高）
-EDGE_PILL_SPAN  = 72   # 药丸长度（左/右时是高，上/下时是宽）
 EDGE_STRIP_WIDTH = 16  # Apple 样式可见条宽度（px）
 EDGE_ANIM_STEPS  = 10  # 滑动动画帧数
 EDGE_ANIM_MS     = 16  # 每帧间隔（ms，共 ~160ms）
@@ -498,7 +500,9 @@ class App:
 
         icon_path = os.path.join(_BASE, "sheep.ico")
         if os.path.exists(icon_path):
-            hicon = user32.LoadImageW(None, icon_path, 1, 0, 0, 0x10)
+            cx    = user32.GetSystemMetrics(49)   # SM_CXSMICON
+            cy    = user32.GetSystemMetrics(50)   # SM_CYSMICON
+            hicon = user32.LoadImageW(None, icon_path, 1, cx, cy, 0x10)
             if not hicon:
                 hicon = self._create_fallback_icon()
         else:
@@ -576,6 +580,49 @@ class App:
             return hicon or ctypes.windll.user32.LoadIconW(None, 32512)
         except Exception:
             return ctypes.windll.user32.LoadIconW(None, 32512)
+
+    @staticmethod
+    def _autostart_enabled() -> bool:
+        if not _IS_WIN:
+            return False
+        import winreg
+        try:
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                               r"Software\Microsoft\Windows\CurrentVersion\Run",
+                               0, winreg.KEY_READ)
+            try:
+                winreg.QueryValueEx(k, "SheepNote")
+                return True
+            except OSError:
+                return False
+            finally:
+                winreg.CloseKey(k)
+        except OSError:
+            return False
+
+    @staticmethod
+    def _set_autostart(on: bool):
+        if not _IS_WIN:
+            return
+        import winreg
+        key_path = r"Software\Microsoft\Windows\CurrentVersion\Run"
+        try:
+            k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key_path,
+                               0, winreg.KEY_SET_VALUE)
+            if on:
+                if getattr(sys, "frozen", False):
+                    exe = f'"{sys.executable}"'
+                else:
+                    exe = f'"{sys.executable}" "{os.path.abspath(__file__)}"'
+                winreg.SetValueEx(k, "SheepNote", 0, winreg.REG_SZ, exe)
+            else:
+                try:
+                    winreg.DeleteValue(k, "SheepNote")
+                except FileNotFoundError:
+                    pass
+            winreg.CloseKey(k)
+        except OSError:
+            pass
 
     def _quit(self):
         if _IS_WIN:
@@ -706,6 +753,86 @@ class _TbBtn(tk.Canvas):
 
 
 # ════════════════════════════════════════════════════════════════════
+class _AppleToggle(tk.Canvas):
+    """iOS-style toggle switch drawn on a Canvas."""
+    W, H = 44, 26
+    OFF_BG, ON_BG = "#D1D1D6", "#34C759"
+
+    def __init__(self, parent, value: bool, command, bg="#FFFFFF"):
+        super().__init__(parent, width=self.W, height=self.H,
+                         bg=bg, highlightthickness=0, bd=0, cursor="hand2")
+        self._val     = value
+        self._cmd     = command
+        self._anim_id = None
+        self._phase   = 1.0 if value else 0.0
+        self._draw()
+        self.bind("<Button-1>", lambda e: self._toggle())
+        self.bind("<Destroy>",  lambda e: self._cancel_anim())
+
+    def _lerp_color(self, t: float) -> str:
+        def h2rgb(h): return (int(h[1:3], 16), int(h[3:5], 16), int(h[5:7], 16))
+        r0, g0, b0 = h2rgb(self.OFF_BG)
+        r1, g1, b1 = h2rgb(self.ON_BG)
+        return "#{:02x}{:02x}{:02x}".format(
+            int(r0 + (r1 - r0) * t),
+            int(g0 + (g1 - g0) * t),
+            int(b0 + (b1 - b0) * t))
+
+    def _draw(self):
+        self.delete("all")
+        t   = self._phase
+        bg  = self._lerp_color(t)
+        r   = self.H // 2
+        # pill background
+        self.create_oval(0, 0, self.H, self.H, fill=bg, outline="")
+        self.create_rectangle(r, 0, self.W - r, self.H, fill=bg, outline="")
+        self.create_oval(self.W - self.H, 0, self.W, self.H, fill=bg, outline="")
+        # thumb
+        m  = 2
+        tx = int(m + t * (self.W - self.H))
+        self.create_oval(tx, m, tx + self.H - m * 2, self.H - m,
+                         fill="#FFFFFF", outline="")
+
+    def _toggle(self):
+        self._val = not self._val
+        if self._anim_id:
+            self.after_cancel(self._anim_id)
+        self._animate()
+        if self._cmd:
+            self._cmd(self._val)
+
+    def _cancel_anim(self):
+        if self._anim_id:
+            try:
+                self.after_cancel(self._anim_id)
+            except Exception:
+                pass
+            self._anim_id = None
+
+    def _animate(self):
+        target = 1.0 if self._val else 0.0
+        diff   = target - self._phase
+        if abs(diff) < 0.04:
+            self._phase = target
+            try:
+                self._draw()
+            except tk.TclError:
+                pass
+            return
+        self._phase += diff * 0.35
+        try:
+            self._draw()
+            self._anim_id = self.after(12, self._animate)
+        except tk.TclError:
+            pass
+
+    def set(self, value: bool):
+        self._val   = value
+        self._phase = 1.0 if value else 0.0
+        self._draw()
+
+
+# ════════════════════════════════════════════════════════════════════
 class StickyNote:
     """单个便签窗口（tk.Toplevel）。"""
 
@@ -756,9 +883,6 @@ class StickyNote:
         self._new_entry:   tk.Entry    | None = None
         self._new_cb:      tk.Label    | None = None
         self._new_outer:   tk.Frame    | None = None
-        self._fs_popup:    tk.Toplevel | None = None
-        self._al_popup:    tk.Toplevel | None = None
-        self._color_popup: tk.Toplevel | None = None
         self._list_popup:  tk.Toplevel | None = None
 
         self.win.configure(bg=self._bg)
@@ -803,8 +927,7 @@ class StickyNote:
         """仅更新视觉颜色，不触发 refresh/save（用于悬停实时预览）。"""
         self._bg = color
         self._compute_derived_colors()
-        self._apply_tb_color()   # 已在此处正确处理 _lock_strip（locked → ACCENT）
-        self._pill_frame.configure(bg=self._tbg)
+        self._apply_tb_color()
         for w in (self.win, self._list_outer, self.canvas,
                   self.sf, self._rsz_canvas, self._sb_canvas):
             try:
@@ -1048,10 +1171,6 @@ class StickyNote:
         self._lock_icon_btn.bind("<Button-1>", lambda e: self._toggle_lock())
         self._lock_icon_btn.bind("<Enter>",    lambda e: self._lock_icon_btn.config(bg="#AAAAAA"))
         self._lock_icon_btn.bind("<Leave>",    lambda e: self._lock_icon_btn.config(bg="#888888"))
-
-        # 边缘收缩药丸覆盖层（收缩时盖住内容，显示主题色药丸）
-        self._pill_frame = tk.Frame(self.win, bg=self._tbg)
-        # 初始不放置，收缩时再 place
 
         # ── 工具栏 ─────────────────────────────────────────────────
         self.tb = tk.Frame(self.win, bg=self._tbg, height=0)
@@ -1616,11 +1735,20 @@ class StickyNote:
             snap_row.pack(fill=tk.X, pady=(0, SP1))
             tk.Label(snap_row, text="边缘自动收缩", bg=BG, fg=FG_TASK,
                      font=FONT_SMALL).pack(side=tk.LEFT)
-            snap_var = tk.BooleanVar(value=self._edge_snap)
-            snap_chk = tk.Checkbutton(snap_row, variable=snap_var, bg=BG,
-                                      activebackground=BG,
-                                      command=lambda: self._set_edge_snap(snap_var.get()))
-            snap_chk.pack(side=tk.RIGHT)
+            _AppleToggle(snap_row, self._edge_snap,
+                         lambda v: self._set_edge_snap(v),
+                         bg=BG).pack(side=tk.RIGHT)
+
+            # ── 开机自动启动（Windows only）──────────────────────────
+            if _IS_WIN:
+                tk.Frame(card, bg="#F0F0F0", height=1).pack(fill=tk.X, pady=(SP1, SP2))
+                auto_row = tk.Frame(card, bg=BG)
+                auto_row.pack(fill=tk.X, pady=(0, SP1))
+                tk.Label(auto_row, text="开机自动启动", bg=BG, fg=FG_TASK,
+                         font=FONT_SMALL).pack(side=tk.LEFT)
+                _AppleToggle(auto_row, App._autostart_enabled(),
+                             lambda v: App._set_autostart(v),
+                             bg=BG).pack(side=tk.RIGHT)
 
         self._open_popup(self.list_btn, "_list_popup", build)
 
@@ -2265,14 +2393,13 @@ class StickyNote:
 
     def _cleanup(self):
         """M: 删除便签前取消所有 after 任务、关闭子弹窗，防止内存泄漏。"""
-        for attr in ("_fs_popup", "_al_popup", "_color_popup", "_list_popup"):
-            p = getattr(self, attr, None)
-            if p:
-                try:
-                    if p.winfo_exists():
-                        p.destroy()
-                except Exception:
-                    pass
+        p = self._list_popup
+        if p:
+            try:
+                if p.winfo_exists():
+                    p.destroy()
+            except Exception:
+                pass
         for attr in ("_round_after", "_tb_anim_id", "_tb_hide_id",
                      "_toast_after", "_sb_hide_id", "_refresh_id",
                      "_edge_poll_id", "_edge_leave_id", "_edge_anim_id"):
