@@ -1,22 +1,14 @@
 """
-SheepNote — 桌面便签小组件 v4.5
-Apple HIG 全面优化：
-  P0 数据安全  : 删除便签/清除已完成加确认；任务删除支持 3s Undo Toast
-  P1 核心体验  : Escape 关闭弹窗 / Ctrl+N 新建 / 统一 Token / FG_HINT 对比度修复
-  P2 视觉一致  : 圆角 / DWM 投影 / ease-out 动画 / 锁定左侧色条
-  P3 精细打磨  : 最小字号调整 / 弹窗字体统一 / 间距网格化
-  v4.1 修复   : 滚轮泄漏 / Mutex 释放 / Toast 状态机 / 托盘线程同步 /
-               _refresh 防抖 / 确认框崩溃 / pending-delete 并发 /
-               列表弹窗状态 / HWND 校验 / 删除时资源清理
-  v4.2 新增   : 锁定按钮移至左下角(hover显示) / 工具栏常驻 / 任务可换行
-               托盘图标内嵌 / 任务栏隐藏 / 边缘自动收缩
-  v4.5 新增   : Apple iOS 样式滑块开关（边缘收缩 / 开机自启）
-               开机自动启动选项（写入注册表 Run 键）
-               修复托盘图标按 SM_CXSMICON 精确加载
-               清理死代码（未使用弹窗属性、常量、pill_frame）
-  跨平台      : Windows (Win32 原生) / macOS (pystray + socket IPC)
+SheepNote — 桌面便签小组件 v5.1
+  v1-v4.5   : 基础便签 / 多便签管理 / 锁定 / 工具栏 / 边缘收缩 / 托盘图标
+              iOS 风格滑块开关 / 开机自启
+  v5.0      : 修复删除任务数据污染 / JSON 原子写入防崩溃丢数据
+              快捷键(Ctrl+D完成 Ctrl+Del删除 ↑↓导航)
+              多显示器安全定位 / GUI 稳定性加固
+  v5.1      : 拖拽排序改为手柄模式(⠿)，解决与输入框/勾选的冲突
+  跨平台    : Windows (Win32 原生) / macOS (pystray + socket IPC)
 """
-_VERSION = "4.5"
+_VERSION = "5.1"
 import colorsys
 import tkinter as tk
 from tkinter import ttk
@@ -28,6 +20,15 @@ _IS_MAC = sys.platform == "darwin"
 
 if _IS_WIN:
     from ctypes import wintypes
+
+    class _RECT(ctypes.Structure):
+        _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
+                     ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+    class _MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", ctypes.c_ulong),
+                     ("rcMonitor", _RECT), ("rcWork", _RECT),
+                     ("dwFlags", ctypes.c_ulong)]
 
 # ── 路径（兼容 PyInstaller）────────────────────────────────────────
 if getattr(sys, "frozen", False):
@@ -660,7 +661,6 @@ class App:
                     snapshots.append(n.snapshot())
                     alive_notes.append(n)
             except tk.TclError:
-                # 这个 note 的 Toplevel 已经被销毁了，跳过
                 pass
 
         self.notes = alive_notes
@@ -671,11 +671,14 @@ class App:
             "notes": snapshots,
         }
 
+        tmp = DATA_FILE + ".tmp"
         try:
-            with open(DATA_FILE, "w", encoding="utf-8") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, DATA_FILE)
         except Exception:
-            pass
+            try: os.unlink(tmp)
+            except OSError: pass
 
     def _apply_lang(self, new_lang: str):
         if new_lang == self.lang:
@@ -884,7 +887,12 @@ class StickyNote:
         self._cleared_done_tasks: list | None = None
         self._refresh_id:         str | None = None     # E: 防抖调度 ID
         self._refresh_focus_new:  bool = False          # E: 防抖期间积累 focus_new
+        self._suppressing:        bool = False          # 删除/撤销期间抑制 flush 和 FocusOut 回写
         self._wheel_bound:        bool = False          # A: 防止重复 bind_all
+        self._drag_task_idx:      int | None = None
+        self._drag_ghost:         tk.Toplevel | None = None
+        self._drag_indicator:     tk.Frame | None = None
+        self._drag_start_y:       int = 0
 
         self.tasks:    list[dict] = data.get("tasks",    [])
         self._topmost: bool  = data.get("topmost",  False)
@@ -1073,7 +1081,9 @@ class StickyNote:
             if self._refresh_id:
                 self.win.after_cancel(self._refresh_id)
                 self._refresh_id = None
+            self._suppressing = True
             self._do_refresh()
+            self._suppressing = False
         self._dismiss_toast()
 
     def _show_clear_undo_toast(self, done_tasks: list):
@@ -1110,7 +1120,9 @@ class StickyNote:
             if self._refresh_id:
                 self.win.after_cancel(self._refresh_id)
                 self._refresh_id = None
+            self._suppressing = True
             self._do_refresh()
+            self._suppressing = False
         self._dismiss_toast()
 
     def _dismiss_toast(self):
@@ -1137,6 +1149,64 @@ class StickyNote:
         elif self._toast_type == "clear" and self._cleared_done_tasks:
             self._undo_clear_done()
 
+    def _focused_task_idx(self) -> int | None:
+        try:
+            fw = self.win.focus_get()
+        except KeyError:
+            return None
+        if not isinstance(fw, tk.Entry):
+            return None
+        rows = [w for w in self.sf.winfo_children() if isinstance(w, tk.Frame)]
+        for i, outer in enumerate(rows):
+            if i >= len(self.tasks):
+                break
+            for inner in outer.winfo_children():
+                if not isinstance(inner, tk.Frame):
+                    continue
+                for w in inner.winfo_children():
+                    if w is fw:
+                        return i
+        return None
+
+    def _kb_toggle_done(self):
+        if self._locked: return
+        idx = self._focused_task_idx()
+        if idx is not None:
+            self._toggle(idx)
+
+    def _kb_delete_task(self):
+        if self._locked: return
+        idx = self._focused_task_idx()
+        if idx is not None:
+            self._delete(idx)
+
+    def _kb_nav(self, direction: int):
+        idx = self._focused_task_idx()
+        rows = [w for w in self.sf.winfo_children() if isinstance(w, tk.Frame)]
+        if idx is None:
+            if direction > 0 and rows:
+                target = 0
+            else:
+                return
+        else:
+            target = idx + direction
+        if target < 0:
+            return
+        if target >= len(self.tasks):
+            if self._new_entry:
+                self._new_entry.focus_set()
+            return
+        if target >= len(rows):
+            return
+        outer = rows[target]
+        for inner in outer.winfo_children():
+            if not isinstance(inner, tk.Frame):
+                continue
+            for w in inner.winfo_children():
+                if isinstance(w, tk.Entry):
+                    w.focus_set()
+                    return
+
     # ════════════════════════════════════════════════════════════════
     # P2: 圆角 + DWM 投影（Windows only；macOS 原生自带）
     # ════════════════════════════════════════════════════════════════
@@ -1157,7 +1227,6 @@ class StickyNote:
             res = ctypes.windll.dwmapi.DwmSetWindowAttribute(
                 hwnd, 33, ctypes.byref(ctypes.c_int(3)), 4)
             if res != 0:
-                self.win.update_idletasks()
                 w = self.win.winfo_width()
                 h = self.win.winfo_height()
                 if w < 4 or h < 4:
@@ -1306,6 +1375,10 @@ class StickyNote:
         # P1: 快捷键
         self.win.bind("<Control-n>", lambda e: self.app.new_note())
         self.win.bind("<Control-z>", lambda e: self._ctrl_z())
+        self.win.bind("<Control-d>", lambda e: self._kb_toggle_done())
+        self.win.bind("<Control-Delete>", lambda e: self._kb_delete_task())
+        self.win.bind("<Up>",   lambda e: self._kb_nav(-1))
+        self.win.bind("<Down>", lambda e: self._kb_nav(1))
         # 点击窗口外（失焦）时保存编辑中的任务
         self.win.bind("<FocusOut>",
                       lambda e: self._commit_editing() if e.widget is self.win else None,
@@ -1480,17 +1553,10 @@ class StickyNote:
     def _monitor_workarea(self) -> tuple:
         if _IS_WIN:
             try:
-                class RECT(ctypes.Structure):
-                    _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long),
-                                ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
-                class MONITORINFO(ctypes.Structure):
-                    _fields_ = [("cbSize", ctypes.c_ulong),
-                                ("rcMonitor", RECT), ("rcWork", RECT),
-                                ("dwFlags", ctypes.c_ulong)]
                 hwnd = self.win.winfo_id()
                 hm   = ctypes.windll.user32.MonitorFromWindow(hwnd, 2)
-                mi   = MONITORINFO()
-                mi.cbSize = ctypes.sizeof(MONITORINFO)
+                mi   = _MONITORINFO()
+                mi.cbSize = ctypes.sizeof(_MONITORINFO)
                 ctypes.windll.user32.GetMonitorInfoW(hm, ctypes.byref(mi))
                 r = mi.rcWork
                 return r.left, r.top, r.right, r.bottom
@@ -1917,6 +1983,7 @@ class StickyNote:
                             pass
 
     def _commit_editing(self):
+        if self._suppressing: return
         self._flush_entries()
         self.app.save()
 
@@ -1941,7 +2008,8 @@ class StickyNote:
             except tk.TclError:
                 pass
 
-        self._flush_entries()
+        if not self._suppressing:
+            self._flush_entries()
         for w in self.sf.winfo_children():
             w.destroy()
         self._new_entry = self._new_cb = None
@@ -1976,6 +2044,17 @@ class StickyNote:
             if not (ox <= e.x_root < ox + outer.winfo_width() and
                     oy <= e.y_root < oy + outer.winfo_height()):
                 for w in _hvw: w.config(bg=bg)
+
+        if can_edit:
+            grip = tk.Label(inner, text="⠿", fg="#CCCCCC", bg=bg,
+                            font=("Microsoft YaHei", 10), cursor="fleur")
+            grip.pack(side=tk.LEFT, padx=(0, 2))
+            _hvw.append(grip)
+            grip.bind("<ButtonPress-1>",   lambda e, i=idx: self._drag_press(i, e))
+            grip.bind("<B1-Motion>",       lambda e: self._drag_motion(e))
+            grip.bind("<ButtonRelease-1>", lambda e: self._drag_release(e))
+            grip.bind("<Enter>", lambda e, g=grip: (hl_on(e), g.config(fg="#999999")))
+            grip.bind("<Leave>", lambda e, g=grip: (hl_off(e), g.config(fg="#CCCCCC")))
 
         cb_text = "☑" if done else "☐"
         cb_fg   = COLOR_SUCCESS if done else "#AAAAAA"
@@ -2103,6 +2182,7 @@ class StickyNote:
         if self._new_cb: self._new_cb.config(fg="#AAAAAA")
 
     def _new_out(self, e: tk.Entry):
+        if self._suppressing: return
         text = e.get().strip()
         if text and text != T("placeholder"):
             self.tasks.append({"text": text, "done": False})
@@ -2133,6 +2213,7 @@ class StickyNote:
         self.app.save(); self._refresh(focus_new=True)
 
     def _live_save(self, idx: int, ent: tk.Entry):
+        if self._suppressing: return
         if idx >= len(self.tasks): return
         try:
             text = ent.get().strip()
@@ -2142,6 +2223,7 @@ class StickyNote:
             self.tasks[idx]["text"] = text
 
     def _save_text(self, idx: int, ent: tk.Entry):
+        if self._suppressing: return
         if idx >= len(self.tasks): return
         try: text = ent.get().strip()
         except tk.TclError: return
@@ -2186,7 +2268,9 @@ class StickyNote:
                 self.win.after_cancel(self._refresh_id)
                 self._refresh_id = None
                 self._refresh_focus_new = False
+            self._suppressing = True
             self._do_refresh()
+            self._suppressing = False
             self._show_undo_toast(task, idx)
 
     def _clear_done(self):
@@ -2197,7 +2281,100 @@ class StickyNote:
             self.win.after_cancel(self._refresh_id)
             self._refresh_id = None
             self._refresh_focus_new = False
+        self._suppressing = True
         self._do_refresh()
+        self._suppressing = False
+
+    # ════════════════════════════════════════════════════════════════
+    # 拖拽排序
+    # ════════════════════════════════════════════════════════════════
+    def _drag_press(self, idx: int, e):
+        if self._locked or self._drag_task_idx is not None:
+            return
+        self._drag_task_idx = idx
+        self._drag_start_y = e.y_root
+        self._drag_ghost = None
+        self._drag_indicator = None
+
+    def _drag_begin(self, idx: int, e):
+        task = self.tasks[idx]
+        ghost = tk.Toplevel(self.win)
+        ghost.overrideredirect(True)
+        ghost.attributes("-alpha", 0.7)
+        ghost.attributes("-topmost", True)
+        ghost.config(bg=self._bg)
+        lbl = tk.Label(ghost, text=task["text"], bg=self._bg, fg=FG_TASK,
+                       font=self._f(), padx=8, pady=4, anchor="w")
+        lbl.pack(fill=tk.X)
+        rows = [w for w in self.sf.winfo_children() if isinstance(w, tk.Frame)]
+        rw = rows[idx].winfo_width() if idx < len(rows) else 200
+        ghost.geometry(f"{rw}x{lbl.winfo_reqheight() + 8}+{e.x_root - 20}+{e.y_root - 10}")
+        self._drag_ghost = ghost
+        self._drag_indicator = tk.Frame(self.sf, bg=ACCENT, height=3)
+
+    def _drag_motion(self, e):
+        if self._drag_task_idx is None:
+            return
+        if not self._drag_ghost:
+            if abs(e.y_root - self._drag_start_y) < 5:
+                return
+            self._drag_begin(self._drag_task_idx, e)
+        if not self._drag_ghost:
+            return
+        self._drag_ghost.geometry(f"+{e.x_root - 20}+{e.y_root - 10}")
+        rows = [w for w in self.sf.winfo_children()
+                if isinstance(w, tk.Frame) and w is not self._drag_indicator]
+        target = len(self.tasks)
+        for i, row in enumerate(rows):
+            ry = row.winfo_rooty()
+            rh = row.winfo_height()
+            if e.y_root < ry + rh // 2:
+                target = i
+                break
+        if self._drag_indicator:
+            self._drag_indicator.pack_forget()
+            if target < len(rows):
+                self._drag_indicator.pack(before=rows[target], fill=tk.X)
+            else:
+                self._drag_indicator.pack(fill=tk.X)
+
+    def _drag_release(self, e):
+        src = self._drag_task_idx
+        if src is None:
+            return
+        if not self._drag_ghost:
+            self._drag_task_idx = None
+            return
+        rows = [w for w in self.sf.winfo_children()
+                if isinstance(w, tk.Frame) and w is not self._drag_indicator]
+        target = len(self.tasks)
+        for i, row in enumerate(rows):
+            ry = row.winfo_rooty()
+            rh = row.winfo_height()
+            if e.y_root < ry + rh // 2:
+                target = i
+                break
+        self._drag_cleanup()
+        if target != src and target != src + 1:
+            task = self.tasks.pop(src)
+            if target > src:
+                target -= 1
+            self.tasks.insert(target, task)
+            self.app.save()
+            self._suppressing = True
+            self._do_refresh()
+            self._suppressing = False
+
+    def _drag_cleanup(self):
+        self._drag_task_idx = None
+        if self._drag_ghost:
+            try: self._drag_ghost.destroy()
+            except Exception: pass
+            self._drag_ghost = None
+        if self._drag_indicator:
+            try: self._drag_indicator.destroy()
+            except Exception: pass
+            self._drag_indicator = None
 
     # ════════════════════════════════════════════════════════════════
     # 锁定
@@ -2257,9 +2434,11 @@ class StickyNote:
         d  = self._saved_geo
         w  = d.get("w", 290)
         h  = d.get("h", 430)
-        sw = self.win.winfo_screenwidth()
-        x  = d.get("x", sw - w - 20 + self._offset)
-        y  = d.get("y", 60 + self._offset)
+        ml, mt, mr, mb = self._monitor_workarea()
+        x  = d.get("x", mr - w - 20 + self._offset)
+        y  = d.get("y", mt + 60 + self._offset)
+        x  = max(ml, min(x, mr - 50))
+        y  = max(mt, min(y, mb - 50))
         self.win.geometry(f"{w}x{h}+{x}+{y}")
         # P2: 圆角 + 投影
         self.win.after(80, self._apply_rounded)
@@ -2336,7 +2515,10 @@ class StickyNote:
                 # peeking 状态下的收缩由 <Leave> timer 驱动，poll 不干预
         except Exception:
             pass
-        self._edge_poll_id = self.win.after(300, self._poll_edge)
+        try:
+            self._edge_poll_id = self.win.after(300, self._poll_edge)
+        except Exception:
+            pass
 
     def _animate_edge_slide(self, sx, sy, tx, ty, w, h, step):
         t = step / EDGE_ANIM_STEPS
